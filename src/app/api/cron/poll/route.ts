@@ -45,6 +45,12 @@ import {
   settlePosition,
   type StrategyParams,
 } from "@/lib/strategy";
+import { classifyMany, lookupStaticLabel } from "@/lib/classify";
+import {
+  fetchMarketsByConditions,
+  parseEndTs,
+  GammaUnreachableError,
+} from "@/lib/gamma";
 
 export const runtime = "nodejs";
 export const maxDuration = 300; // 5 minutes
@@ -471,6 +477,125 @@ async function runOnce(): Promise<{
       winnerOutcomeIdx: winnerIdx,
       outcomeIdx: mm.outcomeIdx,
     });
+  }
+
+  // Step 5b: lazy-classify newly-seen markets that still have category=null.
+  //
+  // The original behavior here was: row gets created with category=null, every
+  // strategy then skips with "market not in tradeable_*". To unblock this:
+  //   1. Try the static label index (free, ~15.5K markets in the research
+  //      tradability parquet).
+  //   2. If still null, batch-fetch question text from Gamma for the unique
+  //      newly-seen condition_ids and classify with Claude Haiku 4.5
+  //      (~$0.0001/market, capped at $5/run).
+  //   3. Update the markets row in-place. Also patch the tokenCache so the
+  //      strategies in this same cron invocation see the category.
+  //
+  // Cost ceiling: at typical 15-min poll cadence we see <100 new markets per
+  // run; budget is generous.
+  const cidsNeedingCategory = new Set<string>();
+  for (const entry of tokenCache.values()) {
+    if (!entry) continue;
+    if (entry.category != null) continue;
+    cidsNeedingCategory.add(entry.conditionId);
+  }
+  // Also pull in any existing markets in the DB that we touched this poll
+  // and that still have category=null. (Avoids classifying the same market
+  // every poll cycle via tokenCache being process-local.)
+  if (cidsNeedingCategory.size > 0) {
+    const existingNullCat = await db
+      .select({ cid: markets.conditionId })
+      .from(markets)
+      .where(
+        and(
+          inArray(markets.conditionId, Array.from(cidsNeedingCategory)),
+          isNull(markets.category),
+        ),
+      );
+    const stillNull = new Set(existingNullCat.map((r) => r.cid));
+    // Drop any cids that now have category in DB (someone else classified)
+    for (const cid of Array.from(cidsNeedingCategory)) {
+      if (!stillNull.has(cid)) cidsNeedingCategory.delete(cid);
+    }
+  }
+  console.log(
+    `[cron] lazy-classify: ${cidsNeedingCategory.size} markets need category`,
+  );
+  // Free pass via static label index first.
+  const lazyResolutions = new Map<string, { category: string | null; endTs: number | null }>();
+  for (const cid of cidsNeedingCategory) {
+    const cat = lookupStaticLabel(cid);
+    if (cat) {
+      lazyResolutions.set(cid, { category: cat, endTs: null });
+    }
+  }
+  // LLM-classify the rest if Anthropic key + Gamma reachable.
+  const stillUnclassified = Array.from(cidsNeedingCategory).filter(
+    (c) => !lazyResolutions.has(c),
+  );
+  console.log(
+    `[cron] lazy-classify: ${lazyResolutions.size} from static labels, ${stillUnclassified.length} need Gamma+LLM`,
+  );
+  if (stillUnclassified.length > 0 && process.env.ANTHROPIC_API_KEY) {
+    try {
+      // Batch-fetch question text + endDate from Gamma.
+      const gammaMap = await fetchMarketsByConditions({
+        conditionIds: stillUnclassified,
+      });
+      const llmInput: Array<{ conditionId: string; question: string | null }> = [];
+      for (const cid of stillUnclassified) {
+        const g = gammaMap.get(cid);
+        if (!g) continue;
+        const endTs = parseEndTs(g.endDate);
+        // Stash endTs early so we update resolution_timestamp even if LLM
+        // call fails or times out.
+        lazyResolutions.set(cid, { category: null, endTs });
+        if ((g.question ?? "").trim()) {
+          llmInput.push({ conditionId: cid, question: g.question });
+        }
+      }
+      if (llmInput.length > 0) {
+        const llmOut = await classifyMany({
+          items: llmInput,
+          concurrency: 8,
+          // Lower budget per poll (we run every 15 min) than per sync (every 6h).
+          budgetUsd: 1,
+        });
+        for (const [cid, cat] of llmOut.entries()) {
+          const prev = lazyResolutions.get(cid) ?? { category: null, endTs: null };
+          lazyResolutions.set(cid, { category: cat, endTs: prev.endTs });
+        }
+      }
+    } catch (e) {
+      if (e instanceof GammaUnreachableError) {
+        console.warn(`[cron] gamma unreachable for lazy-classify; skipping LLM step`);
+      } else {
+        console.warn(`[cron] lazy-classify failed:`, (e as Error).message);
+      }
+    }
+  }
+  // Persist the resolved categories + resolution timestamps. Also patch
+  // tokenCache so strategies see the category in this same invocation.
+  for (const [cid, info] of lazyResolutions.entries()) {
+    if (info.category == null && info.endTs == null) continue;
+    await db
+      .update(markets)
+      .set({
+        category: info.category != null ? info.category : sql`${markets.category}`,
+        resolutionTimestamp:
+          info.endTs != null
+            ? sql`coalesce(${markets.resolutionTimestamp}, ${info.endTs})`
+            : sql`${markets.resolutionTimestamp}`,
+        updatedAt: new Date(),
+      })
+      .where(eq(markets.conditionId, cid));
+    for (const entry of tokenCache.values()) {
+      if (!entry) continue;
+      if (entry.conditionId !== cid) continue;
+      if (info.category != null) entry.category = info.category;
+      if (info.endTs != null && entry.resolutionTimestamp == null)
+        entry.resolutionTimestamp = info.endTs;
+    }
   }
 
   // Step 6: decode trades

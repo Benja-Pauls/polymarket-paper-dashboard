@@ -14,6 +14,7 @@
     "export-seed": "python scripts/export_seed.py"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.91.1",
     "@base-ui/react": "^1.4.1",
     "@neondatabase/serverless": "^1.1.0",
     "class-variance-authority": "^0.7.1",

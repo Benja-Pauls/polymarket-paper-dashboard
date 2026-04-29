@@ -18,6 +18,16 @@ export const config: VercelConfig = {
       // Every 15 minutes.
       schedule: "*/15 * * * *",
     },
+    {
+      // Sync OPEN markets from Polymarket Gamma + classify with static labels
+      // and Claude Haiku 4.5. Required because Goldsky's Condition entity has
+      // no concept of `endDate` — without this, every newly-tradeable market
+      // has `resolution_timestamp = NULL` and every strategy skips with
+      // "no resolution timestamp known".
+      path: "/api/cron/sync-open-markets",
+      // Every 6 hours. Open-markets list doesn't change fast.
+      schedule: "0 */6 * * *",
+    },
   ],
 };
 
