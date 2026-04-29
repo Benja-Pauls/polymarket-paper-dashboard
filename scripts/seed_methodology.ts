@@ -317,6 +317,77 @@ Result: in-sample mean ret/$ = **+3.93** (vs v1 base +1.27 — a +2.66 lift). Fo
   },
 
   // ──────────────────────────────────────────────────────────────────────
+  // 3b. geo_deep_longshot_v4_catalyst_3d
+  // ──────────────────────────────────────────────────────────────────────
+  {
+    strategyId: "geo_deep_longshot_v4_catalyst_3d",
+    hypothesis: `**Strategy v3 already requires a future catalyst, but catalysts within 0–3 days have effectively arrived: market participants know the event is imminent and price moves to the favored outcome. Adding a 3-day minimum lead time keeps surprise potential intact while still requiring market-relevant news. Plus: heuristic-only catalysts (no real Wikipedia/GDELT source) are unreliable signals — exclude them.**
+
+R&D wave 4 audit on v3's trade ledger split bets by catalyst lead time and showed the per-bet edge is concentrated almost entirely in the ≥ 3-day bucket; catalysts within 0–3 days produce roughly break-even outcomes because the surprise has already been priced in. Layering a "real catalyst source" filter (gdelt OR wikipedia, dropping heuristic-only) tightens the universe further.
+
+Result: STRONGEST forward result yet — in-sample mean ret/$ = **+4.29** (vs v3 +3.93, v1 +1.27); forward-OOS mean ret/$ = **+3.19** (vs v3 +1.78, v1 +1.25). And critically: per-year alpha-tier in EVERY year — 2024 (+6.13), 2025 (+4.22), 2026 (+4.00). v3 (no min-lead, allows heuristic) leaves real edge on the table.`,
+    inSample: {
+      mean_ret_per_dollar: 4.29,
+      total_pnl: 104_000,
+      p5: 57_000,
+      p_pos: 1.0,
+      top1_pct: 5.0,
+      n_bets: 484,
+      span_label: "21mo (Aug 2024 – Apr 2026)",
+    },
+    forward: {
+      mean_ret_per_dollar: 3.19,
+      total_pnl: 44_000,
+      p5: 12_700,
+      p_pos: 0.995,
+      top1_pct: 29.3,
+      n_bets: 277,
+      span_label: "Forward-OOS (~3.6mo, annualized P5 ≈ $43K)",
+    },
+    perYear: {
+      "2024": {
+        mean_ret_per_dollar: 6.13,
+        span_label: "Aug – Dec 2024",
+      },
+      "2025": {
+        mean_ret_per_dollar: 4.22,
+        span_label: "Full year 2025",
+      },
+      "2026": {
+        mean_ret_per_dollar: 4.00,
+        span_label: "Jan – Apr 2026 (forward)",
+      },
+    },
+    filters: [
+      SHARED_FILTERS.geo_only,
+      SHARED_FILTERS.ep_15,
+      SHARED_FILTERS.hours24,
+      SHARED_FILTERS.vol100,
+      SHARED_FILTERS.cap20,
+      {
+        name: "Require future public catalyst ≥ 3 days out",
+        description:
+          "Only bet markets whose known scheduled public event is at least 72 hours in the future at trade time. Catalysts within 0–3 days have effectively arrived.",
+        validation:
+          "v3 → v4 lift: in-sample mean ret/$ +3.93 → +4.29 (+0.36); forward +1.78 → +3.19 (+1.41). The forward lift is the load-bearing one and it nearly doubles the per-bet edge.",
+      },
+      {
+        name: "Require real catalyst source (gdelt OR wikipedia)",
+        description:
+          "Reject markets whose catalyst record came only from the heuristic source. Real news-derived catalysts (gdelt or wikipedia) carry materially more signal.",
+        validation:
+          "Heuristic-only catalysts behave near-random in audits; restricting to gdelt/wikipedia tightens the universe and lifts per-bet edge without hurting bet density meaningfully.",
+      },
+    ],
+    knownIssues: `- Top-1 concentration **29.3% on the forward sample is borderline** (Bar 1 limit is 30%). One bad market could push the strategy over the limit; monitor live concentration carefully.
+- **March 2026 still shows weakness (+0.45 mean ret/$)** regardless of catalyst lead time — this is a regime-specific issue and not solvable by tighter catalyst filtering alone.
+- **Forward span only 3.6 months** — annualized projections (P5 ≈ $43K/yr on $5K bankroll) extrapolate a short window; treat as suggestive not definitive.
+- Catalyst data is curated retrospectively; in-sample numbers may be optimistic. Forward (+3.19) is the trustworthy metric.
+- Smaller universe than v3 — fewer bets means more variance.`,
+    barStatus: "Bar 2 alpha",
+  },
+
+  // ──────────────────────────────────────────────────────────────────────
   // 4. all_cat_tight_v1
   // ──────────────────────────────────────────────────────────────────────
   {

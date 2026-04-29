@@ -255,6 +255,7 @@ async function processStrategyTrade(args: {
   marketCategory: string | null;
   marketRunningVolumeUsdc: number;
   marketCatalystTs: number | null;
+  marketCatalystSource: string | null;
 }): Promise<void> {
   const {
     state,
@@ -263,6 +264,7 @@ async function processStrategyTrade(args: {
     marketCategory,
     marketRunningVolumeUsdc,
     marketCatalystTs,
+    marketCatalystSource,
   } = args;
 
   if (trade.timestamp <= (state.strategy.lastPollTs ?? 0)) {
@@ -285,6 +287,7 @@ async function processStrategyTrade(args: {
     marketRunningVolumeUsdc,
     marketBetCount: await getBetCount(state, trade.conditionId),
     marketCatalystTs,
+    marketCatalystSource,
     cash: state.cash,
     stake: state.strategy.stake,
     params: state.params,
@@ -519,23 +522,28 @@ async function runOnce(): Promise<{
     }
   }
 
-  // Pre-load catalyst timestamps for all unique conditionIds. Only loaded if
-  // any active strategy actually uses `require_future_catalyst` (avoids a
-  // useless query when no one needs it).
+  // Pre-load catalyst timestamps + sources for all unique conditionIds. Only
+  // loaded if any active strategy actually uses `require_future_catalyst`
+  // (avoids a useless query when no one needs it).
   const anyStrategyNeedsCatalyst = states.some(
     (s) => s.params.require_future_catalyst === true,
   );
-  const catalystCache = new Map<string, number>();
+  const catalystCache = new Map<
+    string,
+    { ts: number; source: string | null }
+  >();
   if (anyStrategyNeedsCatalyst && uniqueCids.length > 0) {
     const catRows = await db
       .select({
         cid: marketCatalysts.conditionId,
         ts: marketCatalysts.catalystTs,
+        source: marketCatalysts.catalystSource,
       })
       .from(marketCatalysts)
       .where(inArray(marketCatalysts.conditionId, uniqueCids));
-    for (const { cid, ts } of catRows) {
-      if (ts != null) catalystCache.set(cid, Number(ts));
+    for (const { cid, ts, source } of catRows) {
+      if (ts != null)
+        catalystCache.set(cid, { ts: Number(ts), source: source ?? null });
     }
   }
 
@@ -547,7 +555,9 @@ async function runOnce(): Promise<{
     const runningVolBefore = meta?.runningVolumeUsdc ?? 0;
     const category = meta?.resolved ? null : meta?.category ?? null;
     const resolutionTs = meta?.resolutionTs ?? null;
-    const catalystTs = catalystCache.get(trade.conditionId) ?? null;
+    const catalystEntry = catalystCache.get(trade.conditionId);
+    const catalystTs = catalystEntry?.ts ?? null;
+    const catalystSource = catalystEntry?.source ?? null;
 
     for (const state of states) {
       await processStrategyTrade({
@@ -557,6 +567,7 @@ async function runOnce(): Promise<{
         marketCategory: category,
         marketRunningVolumeUsdc: runningVolBefore,
         marketCatalystTs: catalystTs,
+        marketCatalystSource: catalystSource,
       });
     }
 

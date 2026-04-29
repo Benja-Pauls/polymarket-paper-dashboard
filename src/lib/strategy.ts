@@ -48,6 +48,22 @@ export type StrategyParams = {
    * to the trade timestamp. Markets with no catalyst record are skipped.
    */
   require_future_catalyst?: boolean;
+  /**
+   * Minimum required lead time (in hours) between the trade and the catalyst.
+   * Only meaningful in combination with `require_future_catalyst: true` and
+   * a non-null `marketCatalystTs`. When set, requires
+   * `catalyst_ts - trade_ts >= min_catalyst_lead_hours * 3600`.
+   * Use case: catalysts within 0–3 days have effectively arrived (favorite
+   * locked in); requiring ≥ 3 days of lead time keeps surprise potential.
+   */
+  min_catalyst_lead_hours?: number;
+  /**
+   * If true, only accept catalysts whose `catalyst_source` is a real news
+   * source ('gdelt' or 'wikipedia'). Heuristic-only catalysts (i.e. any
+   * source value of 'heuristic' or null) are rejected. Only meaningful in
+   * combination with `require_future_catalyst: true`.
+   */
+  require_real_catalyst_source?: boolean;
 };
 
 export type StrategyConfig = {
@@ -192,6 +208,29 @@ export const STRATEGIES: StrategyConfig[] = [
       slippage: 0.02,
     },
   },
+  {
+    id: "geo_deep_longshot_v4_catalyst_3d",
+    name: "GEO Deep Longshot v4 (Catalyst ≥3d)",
+    description:
+      "GEO Deep Longshot + only bet when a public catalyst is ≥ 3 days in the future. Mechanism: catalyst within 0-3 days = news has effectively arrived (favorite locked in). Catalyst ≥ 3 days = surprise potential intact. STRONGEST forward result yet: +3.19 mean_ret/$, +$44K total / 3.6mo. Per-year alpha-tier in 2024 (+6.13), 2025 (+4.22), 2026 (+4.00).",
+    startingBankroll: 1000,
+    stake: 10,
+    active: true,
+    params: {
+      categories: ["tradeable_geopolitical"],
+      ep_lo: 0.05,
+      ep_hi: 0.15,
+      min_hours_to_res: 24,
+      max_market_volume: 100_000,
+      cap_per_market: 20,
+      require_future_catalyst: true,
+      // Catalyst must be ≥ 3 days in the future at trade time.
+      min_catalyst_lead_hours: 72,
+      // Exclude heuristic-only catalysts; require gdelt or wikipedia source.
+      require_real_catalyst_source: true,
+      slippage: 0.02,
+    },
+  },
 ];
 
 /**
@@ -247,6 +286,12 @@ export function evaluateTrade(args: {
    * gated strategies.
    */
   marketCatalystTs?: number | null;
+  /**
+   * Public-catalyst source label for this market, if known. One of
+   * 'gdelt' | 'wikipedia' | 'heuristic' | null. Used by strategies with
+   * `require_real_catalyst_source: true`.
+   */
+  marketCatalystSource?: string | null;
   cash: number;
   stake: number;
   params: StrategyParams;
@@ -258,6 +303,7 @@ export function evaluateTrade(args: {
     marketRunningVolumeUsdc,
     marketBetCount,
     marketCatalystTs,
+    marketCatalystSource,
     cash,
     stake,
     params,
@@ -366,6 +412,38 @@ export function evaluateTrade(args: {
         entryPrice,
         betOutcome,
       };
+    }
+    // Optional minimum lead-time filter (e.g. require catalyst ≥ 3 days
+    // in the future). Catalysts within 0–3 days have effectively arrived.
+    if (
+      typeof params.min_catalyst_lead_hours === "number" &&
+      params.min_catalyst_lead_hours > 0
+    ) {
+      const leadSeconds = marketCatalystTs - trade.timestamp;
+      const requiredSeconds = params.min_catalyst_lead_hours * 3600;
+      if (leadSeconds < requiredSeconds) {
+        const needDays = params.min_catalyst_lead_hours / 24;
+        const haveDays = leadSeconds / 86400;
+        return {
+          action: "skip",
+          reason: `catalyst within ${haveDays.toFixed(2)}d (need ≥${needDays}d)`,
+          entryPrice,
+          betOutcome,
+        };
+      }
+    }
+    // Optional "real-source" filter: only accept gdelt / wikipedia catalysts.
+    // Reject heuristic-only catalysts (and unknown sources) as unreliable.
+    if (params.require_real_catalyst_source === true) {
+      const src = (marketCatalystSource ?? "").toLowerCase();
+      if (src !== "gdelt" && src !== "wikipedia") {
+        return {
+          action: "skip",
+          reason: `catalyst source=${marketCatalystSource ?? "null"} not in {gdelt, wikipedia}`,
+          entryPrice,
+          betOutcome,
+        };
+      }
     }
   }
   if (cash < stake) {
