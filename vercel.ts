@@ -8,16 +8,15 @@ export const config: VercelConfig = {
   //  - Hobby plan minimum interval: daily.
   //  - Pro plan minimum interval: 1 minute.
   //
-  // For useful live paper-trading at "every 5 min" granularity, upgrade to
-  // Pro and change `schedule` to "*/5 * * * *". The endpoint is idempotent;
-  // the only thing that changes is how often cap-10 chronological filling
-  // sees fresh trades.
+  // Pro plan unlocked 2026-04-29 evening. 15-min polling is enough granularity
+  // for paper-trading; each invocation polls Goldsky for recent trades, applies
+  // all active strategies' filters, and writes signals/positions to the DB.
+  // The endpoint is idempotent — duplicate trades are deduped by trade_id.
   crons: [
     {
       path: "/api/cron/poll",
-      // Once a day at 14:30 UTC. Hobby plan max frequency.
-      // Bump to "*/5 * * * *" after upgrading to Pro.
-      schedule: "30 14 * * *",
+      // Every 15 minutes.
+      schedule: "*/15 * * * *",
     },
   ],
 };
