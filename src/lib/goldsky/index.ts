@@ -239,7 +239,14 @@ export async function fetchMarketMetadata(args: {
 
 /**
  * Batched fetch of resolution metadata for many condition_ids.
- * Returns map of conditionId -> {resolutionTimestamp, payouts, winnerOutcomeIdx}.
+ *
+ * Strategy:
+ *   1. orderbook_resync.conditions has both `resolutionTimestamp` and `payouts`
+ *      for any market created BEFORE Jan 5 2026.
+ *   2. For post-freeze markets, fall back to pnl.conditions which has
+ *      `payoutNumerators` + `payoutDenominator` (winner can be derived).
+ *      Resolution timestamp is unknown from pnl.conditions alone — for those
+ *      markets, the cron will skip the trade because resolution_ts is null.
  */
 export async function fetchMarketMetadataBatch(args: {
   conditionIds: string[];
@@ -266,20 +273,19 @@ export async function fetchMarketMetadataBatch(args: {
   if (unique.length === 0) return out;
 
   const CHUNK = 100;
-  const q = `query Conds($ids: [ID!]!) {
+  const q1 = `query Conds($ids: [ID!]!) {
     conditions(first: 1000, where: { id_in: $ids }) {
       id
       resolutionTimestamp
       payouts
     }
   }`;
-
   for (let i = 0; i < unique.length; i += CHUNK) {
     const batch = unique.slice(i, i + CHUNK);
     try {
       const data = (await gqlPost(
         SUBGRAPHS.orderbook_resync,
-        q,
+        q1,
         { ids: batch },
         args.signal,
       )) as {
@@ -311,6 +317,52 @@ export async function fetchMarketMetadataBatch(args: {
       // tolerate
     }
   }
+
+  // Fallback: pnl-subgraph for post-freeze markets (no res_ts, but winner ok)
+  const missing = unique.filter((c) => !out.has(c));
+  if (missing.length > 0) {
+    const q2 = `query Conds($ids: [ID!]!) {
+      conditions(first: 1000, where: { id_in: $ids }) {
+        id
+        payoutNumerators
+        payoutDenominator
+      }
+    }`;
+    for (let i = 0; i < missing.length; i += CHUNK) {
+      const batch = missing.slice(i, i + CHUNK);
+      try {
+        const data = (await gqlPost(SUBGRAPHS.pnl, q2, { ids: batch }, args.signal)) as {
+          conditions?: Array<{
+            id: string;
+            payoutNumerators?: string[] | null;
+            payoutDenominator?: string | null;
+          }>;
+        } | null;
+        for (const c of data?.conditions ?? []) {
+          let winner: number | null = null;
+          let payouts: string[] | null = null;
+          const denom = c.payoutDenominator != null ? Number(c.payoutDenominator) : 0;
+          if (c.payoutNumerators && denom > 0) {
+            payouts = c.payoutNumerators.map((n) => String(Number(n) / denom));
+            for (let j = 0; j < c.payoutNumerators.length; j++) {
+              const v = Number(c.payoutNumerators[j]);
+              if (Number.isFinite(v) && v > 0 && v >= denom * 0.5 + 0.0001) {
+                winner = j;
+                break;
+              }
+            }
+          }
+          out.set(String(c.id), {
+            resolutionTimestamp: null,
+            payouts,
+            winnerOutcomeIdx: winner,
+          });
+        }
+      } catch {
+        // tolerate
+      }
+    }
+  }
   return out;
 }
 
@@ -334,10 +386,15 @@ export async function fetchMarketForToken(args: {
 
 /**
  * Batched reverse-lookup: many token ids -> map of token -> {conditionId, outcomeIdx}.
- * Pages in chunks of 100 (Goldsky's _in filter limit).
+ * Pages in chunks of 100.
  *
- * Tries the live `orderbook` subgraph first, then falls back to the frozen
- * `orderbook_resync` for any unresolved tokens.
+ * Source of truth: `positions-subgraph.tokenIdCondition`. The orderbook
+ * subgraph has marketData.outcomeIndex but it's null for most CLOB markets,
+ * so we don't use it.
+ *
+ * Note: positions-subgraph has a few-second-to-minute indexing lag behind
+ * the orderbook stream, so a brand-new market's first trade may not resolve
+ * on the same poll. The cron is idempotent — a later poll will pick it up.
  */
 export async function fetchMarketsForTokens(args: {
   tokenIds: string[];
@@ -348,43 +405,33 @@ export async function fetchMarketsForTokens(args: {
   if (unique.length === 0) return result;
 
   const CHUNK = 100;
-  const q = `query Tok($ids: [ID!]!) {
-    marketDatas(first: 1000, where: { id_in: $ids }) {
+  const q = `query Tok($ids: [String!]!) {
+    tokenIdConditions(first: 1000, where: { id_in: $ids }) {
       id
-      condition
       outcomeIndex
+      condition { id }
     }
   }`;
 
-  async function batchOn(url: string, ids: string[]): Promise<void> {
-    if (ids.length === 0) return;
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const batch = unique.slice(i, i + CHUNK);
     try {
-      const data = (await gqlPost(url, q, { ids }, args.signal)) as {
-        marketDatas?: Array<{
+      const data = (await gqlPost(SUBGRAPHS.positions, q, { ids: batch }, args.signal)) as {
+        tokenIdConditions?: Array<{
           id: string;
-          condition?: string | null;
           outcomeIndex?: string | null;
+          condition?: { id: string } | null;
         }>;
       } | null;
-      for (const m of data?.marketDatas ?? []) {
-        if (!m.id || !m.condition) continue;
+      for (const m of data?.tokenIdConditions ?? []) {
+        if (!m.id || !m.condition?.id) continue;
         const idx = Number(m.outcomeIndex ?? "-1");
         if (!Number.isFinite(idx) || idx < 0) continue;
-        result.set(String(m.id), { conditionId: m.condition, outcomeIdx: idx });
+        result.set(String(m.id), { conditionId: m.condition.id, outcomeIdx: idx });
       }
     } catch {
       // partial failures are ok; missing tokens will be skipped downstream
     }
-  }
-
-  // Round 1: live orderbook subgraph
-  for (let i = 0; i < unique.length; i += CHUNK) {
-    await batchOn(SUBGRAPHS.orderbook, unique.slice(i, i + CHUNK));
-  }
-  // Round 2: orderbook_resync for tokens we didn't find
-  const missing = unique.filter((t) => !result.has(t));
-  for (let i = 0; i < missing.length; i += CHUNK) {
-    await batchOn(SUBGRAPHS.orderbook_resync, missing.slice(i, i + CHUNK));
   }
   return result;
 }
