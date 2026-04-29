@@ -1,5 +1,5 @@
-// Reset the strategy poll cursor to N days ago. Useful for backfilling
-// the dashboard from historical Goldsky data.
+// Reset poll cursor for ALL active strategies to N days ago. Useful for
+// backfilling the dashboard from historical Goldsky data.
 //
 // Usage: pnpm exec tsx --env-file=.env.local scripts/reset_cursor.ts [days]
 
@@ -14,9 +14,9 @@ async function main() {
     process.env.DATABASE_URL_UNPOOLED;
   if (!dbUrl) throw new Error("DATABASE_URL not set");
   const sql = neon(dbUrl);
-  await sql`update strategies set last_poll_ts = ${since} where id = 'tighter_blanket_cap10_3day'`;
-  const rows = await sql`select id, last_poll_ts, current_cash from strategies`;
-  console.log(`reset cursor to ${since} (${days} days ago)`);
+  await sql`update strategies set last_poll_ts = ${since} where status = 'active'`;
+  const rows = await sql`select id, status, last_poll_ts, current_cash from strategies order by id`;
+  console.log(`reset cursor to ${since} (${days} days ago) on all active strategies`);
   console.log(rows);
 }
 

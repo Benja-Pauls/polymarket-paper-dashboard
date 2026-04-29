@@ -1,21 +1,26 @@
-// Vercel Cron handler — polls Goldsky for new trades and applies the
-// strategy filter. Runs every 5 minutes per `vercel.ts`.
+// Vercel Cron handler — polls Goldsky for new trades and applies each ACTIVE
+// strategy's filter. Daily on Hobby plan; bump to */5 after Pro upgrade.
 //
 // Logic:
 //   1. Load active strategies and their last_poll_ts cursors.
-//   2. Fetch new orderFilledEvents since cursor from the orderbook subgraph.
-//   3. For each trade, decode token_id -> conditionId via either:
-//        a. The DB markets table (if the cron has populated it for this market)
-//        b. The activity-subgraph reverse lookup (if we haven't seen it before)
-//   4. Apply strategy filter; insert Signal rows; for `bet` decisions insert
-//      Position rows and decrement strategy.current_cash.
-//   5. Settle any open positions whose markets resolved.
-//   6. Take a daily snapshot per strategy.
+//   2. Use the EARLIEST cursor across strategies as the global fetch floor.
+//   3. Fetch new orderFilledEvents since cursor from the orderbook subgraph.
+//   4. Decode each trade -> (conditionId, outcomeIdx, price, ts, notionalUsd).
+//   5. Sort decoded trades chronologically (older first).
+//   6. For EACH trade, in order:
+//      a. For each active strategy: evaluate, write Signal + (if bet) Position.
+//         Each strategy reads market_running_volume_usdc as it was BEFORE this
+//         trade.
+//      b. After all strategies have evaluated, BUMP markets.running_volume_usdc
+//         by this trade's notionalUsd. (So the NEXT trade's pre-trade volume
+//         includes this one.)
+//   7. Settle resolved positions per strategy.
+//   8. Take a daily snapshot per strategy.
 //
 // NO real-money execution. Paper-money only.
 
 import { NextResponse } from "next/server";
-import { and, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 
 import { db } from "@/lib/db";
 import {
@@ -34,7 +39,11 @@ import {
   fetchTradesSince,
   type DecodedTrade,
 } from "@/lib/goldsky";
-import { STRATEGY, evaluateTrade, settlePosition, TRADEABLE_CATEGORIES } from "@/lib/strategy";
+import {
+  evaluateTrade,
+  settlePosition,
+  type StrategyParams,
+} from "@/lib/strategy";
 
 export const runtime = "nodejs";
 export const maxDuration = 300; // 5 minutes
@@ -55,9 +64,6 @@ type MarketCacheEntry = {
 const tokenCache = new Map<string, MarketCacheEntry | null>();
 
 function isAuthorized(req: Request): boolean {
-  // Vercel sets `x-vercel-cron-signature` on cron-triggered requests.
-  // For local manual triggers, allow if CRON_SECRET matches a header or
-  // if VERCEL_ENV is unset (= local dev).
   if (req.headers.get("x-vercel-cron-signature")) return true;
   const secret = process.env.CRON_SECRET;
   if (secret) {
@@ -65,7 +71,6 @@ function isAuthorized(req: Request): boolean {
     if (auth === `Bearer ${secret}`) return true;
     return false;
   }
-  // No secret configured + no cron signature: allow only outside production.
   return process.env.VERCEL_ENV !== "production";
 }
 
@@ -93,8 +98,6 @@ async function settleResolvedOpenPositions(args: {
   for (const { pos, mkt } of open) {
     if (!mkt) continue;
     if (!mkt.resolved || mkt.winnerOutcomeIdx == null) {
-      // Force a re-fetch of the market metadata in case it resolved since we
-      // last looked. Use the conditionId.
       try {
         const live = await fetchMarketMetadata({ conditionId: mkt.conditionId });
         if (live && live.winnerOutcomeIdx != null) {
@@ -152,7 +155,6 @@ async function settleResolvedOpenPositions(args: {
 async function takeDailySnapshot(strategyId: string) {
   const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
 
-  // Aggregate current state
   const [strat] = await db.select().from(strategies).where(eq(strategies.id, strategyId));
   if (!strat) return;
   const openRows = await db
@@ -162,13 +164,16 @@ async function takeDailySnapshot(strategyId: string) {
   const closedRows = await db
     .select({ payout: positionsTable.payout, stake: positionsTable.stake })
     .from(positionsTable)
-    .where(and(eq(positionsTable.strategyId, strategyId), sql`${positionsTable.settledTs} is not null`));
-  const nBetsTotal = (
-    await db
-      .select({ c: sql<number>`count(*)::int` })
-      .from(signalsTable)
-      .where(and(eq(signalsTable.strategyId, strategyId), eq(signalsTable.decision, "bet")))
-  )[0]?.c ?? 0;
+    .where(
+      and(eq(positionsTable.strategyId, strategyId), sql`${positionsTable.settledTs} is not null`),
+    );
+  const nBetsTotal =
+    (
+      await db
+        .select({ c: sql<number>`count(*)::int` })
+        .from(signalsTable)
+        .where(and(eq(signalsTable.strategyId, strategyId), eq(signalsTable.decision, "bet")))
+    )[0]?.c ?? 0;
 
   const nOpen = openRows.length;
   const totalOpenStake = openRows.reduce((s, r) => s + Number(r.stake), 0);
@@ -195,153 +200,138 @@ async function takeDailySnapshot(strategyId: string) {
     .onConflictDoNothing();
 }
 
-async function processStrategyForTrades(args: {
+type StrategyRuntimeState = {
   strategy: Strategy;
-  decoded: DecodedTrade[];
-}) {
-  const { strategy, decoded } = args;
-  let nBetsAdded = 0;
-  let nSkipped = 0;
-  let nDuplicates = 0;
-  let cashSpent = 0;
+  params: StrategyParams;
+  cash: number;
+  betCountByMarket: Map<string, number>;
+  /** Counters for the cron summary. */
+  nBetsAdded: number;
+  nSkipped: number;
+  nDuplicates: number;
+  cashSpent: number;
+};
 
-  // Refresh strategy in-process (we mutate locally) so we respect cap reads.
-  let cash = strategy.currentCash;
+async function buildRuntimeState(strat: Strategy): Promise<StrategyRuntimeState> {
+  return {
+    strategy: strat,
+    params: strat.paramsJson as unknown as StrategyParams,
+    cash: Number(strat.currentCash),
+    betCountByMarket: new Map(),
+    nBetsAdded: 0,
+    nSkipped: 0,
+    nDuplicates: 0,
+    cashSpent: 0,
+  };
+}
 
-  // Cache of marketCid -> count of existing bet signals (for cap=10 check)
-  const betCountCache = new Map<string, number>();
-  async function getBetCount(cid: string): Promise<number> {
-    if (betCountCache.has(cid)) return betCountCache.get(cid)!;
-    const r = await db
-      .select({ c: sql<number>`count(*)::int` })
-      .from(signalsTable)
-      .where(
-        and(
-          eq(signalsTable.strategyId, strategy.id),
-          eq(signalsTable.marketCid, cid),
-          eq(signalsTable.decision, "bet"),
-        ),
-      );
-    const c = r[0]?.c ?? 0;
-    betCountCache.set(cid, c);
-    return c;
+async function getBetCount(state: StrategyRuntimeState, cid: string): Promise<number> {
+  const cached = state.betCountByMarket.get(cid);
+  if (cached != null) return cached;
+  const r = await db
+    .select({ c: sql<number>`count(*)::int` })
+    .from(signalsTable)
+    .where(
+      and(
+        eq(signalsTable.strategyId, state.strategy.id),
+        eq(signalsTable.marketCid, cid),
+        eq(signalsTable.decision, "bet"),
+      ),
+    );
+  const c = r[0]?.c ?? 0;
+  state.betCountByMarket.set(cid, c);
+  return c;
+}
+
+/**
+ * For one trade and one strategy, evaluate, write the signal, and (if bet)
+ * write the position + decrement cash.
+ */
+async function processStrategyTrade(args: {
+  state: StrategyRuntimeState;
+  trade: DecodedTrade;
+  marketResolutionTs: number | null;
+  marketCategory: string | null;
+  marketRunningVolumeUsdc: number;
+}): Promise<void> {
+  const { state, trade, marketResolutionTs, marketCategory, marketRunningVolumeUsdc } = args;
+
+  if (trade.timestamp <= (state.strategy.lastPollTs ?? 0)) {
+    // Already past our cursor — defensive
+    return;
   }
 
-  // Sort trades by timestamp ascending (cap=10 chronological check)
-  decoded.sort((a, b) => a.timestamp - b.timestamp);
+  const decision = evaluateTrade({
+    trade: {
+      rawTradeId: trade.rawTradeId,
+      conditionId: trade.conditionId,
+      wallet: trade.wallet,
+      side: trade.side,
+      outcomeIdx: trade.outcomeIdx,
+      price: trade.price,
+      timestamp: trade.timestamp,
+    },
+    marketResolutionTs,
+    marketCategory,
+    marketRunningVolumeUsdc,
+    marketBetCount: await getBetCount(state, trade.conditionId),
+    cash: state.cash,
+    stake: state.strategy.stake,
+    params: state.params,
+  });
 
-  for (const trade of decoded) {
-    if (trade.timestamp <= (strategy.lastPollTs ?? 0)) {
-      // Already past our cursor — defensive
-      continue;
-    }
-    // Skip our own (impossible in paper-trade) trades. No-op.
-
-    // Find the market metadata. Either from DB or activity lookup.
-    const mr = await db
-      .select()
-      .from(markets)
-      .where(eq(markets.conditionId, trade.conditionId))
-      .limit(1);
-    let marketRow = mr[0];
-
-    if (!marketRow) {
-      // We have a token cache hit (otherwise we wouldn't have decoded), so
-      // the upsert in step 5 of runOnce already wrote this market — re-read.
-      const re = await db
-        .select()
-        .from(markets)
-        .where(eq(markets.conditionId, trade.conditionId))
-        .limit(1);
-      marketRow = re[0];
-    }
-
-    const category = marketRow?.category ?? null;
-    const resolutionTs = marketRow?.resolutionTimestamp ?? null;
-    const resolved = marketRow?.resolved ?? 0;
-
-    // Strategy filter
-    const decision = evaluateTrade({
-      trade: {
-        rawTradeId: trade.rawTradeId,
-        conditionId: trade.conditionId,
-        wallet: trade.wallet,
-        side: trade.side,
-        outcomeIdx: trade.outcomeIdx,
-        price: trade.price,
-        timestamp: trade.timestamp,
-      },
-      marketResolutionTs: resolutionTs,
-      marketCategory: resolved ? null : category,
-      marketBetCount: await getBetCount(trade.conditionId),
-      cash,
-      stake: strategy.stake,
-      params: STRATEGY.params,
-    });
-
-    // Insert signal (idempotent on (strategyId, rawTradeId))
-    let signalId: number | null = null;
-    try {
-      const ins = await db
-        .insert(signalsTable)
-        .values({
-          strategyId: strategy.id,
-          marketCid: trade.conditionId,
-          rawTradeId: trade.rawTradeId,
-          rawWallet: trade.wallet,
-          rawTs: trade.timestamp,
-          rawSide: trade.side,
-          rawPrice: trade.price,
-          rawOutcomeIdx: trade.outcomeIdx,
-          decision: decision.action,
-          reason: decision.reason,
-          entryPrice: decision.entryPrice ?? null,
-          betOutcome: decision.betOutcome ?? null,
-        })
-        .returning({ id: signalsTable.id });
-      signalId = ins[0]?.id ?? null;
-    } catch (e) {
-      // Likely unique-constraint duplicate; just skip
-      const msg = (e as Error).message || "";
-      if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) {
-        nDuplicates += 1;
-        continue;
-      }
-      throw e;
-    }
-
-    if (decision.action === "bet" && signalId != null) {
-      await db.insert(positionsTable).values({
-        strategyId: strategy.id,
-        signalId,
+  // Insert signal (idempotent on (strategyId, rawTradeId))
+  let signalId: number | null = null;
+  try {
+    const ins = await db
+      .insert(signalsTable)
+      .values({
+        strategyId: state.strategy.id,
         marketCid: trade.conditionId,
-        side: trade.side,
-        entryPrice: decision.entryPrice,
-        betOutcome: decision.betOutcome,
-        stake: strategy.stake,
-        entryTs: trade.timestamp,
-        plannedResolutionTs: resolutionTs,
-      });
-      cash -= strategy.stake;
-      cashSpent += strategy.stake;
-      nBetsAdded += 1;
-      betCountCache.set(trade.conditionId, (betCountCache.get(trade.conditionId) ?? 0) + 1);
-    } else {
-      nSkipped += 1;
-    }
-  }
-
-  if (cashSpent > 0) {
-    await db
-      .update(strategies)
-      .set({
-        currentCash: sql`${strategies.currentCash} - ${cashSpent}`,
-        updatedAt: new Date(),
+        rawTradeId: trade.rawTradeId,
+        rawWallet: trade.wallet,
+        rawTs: trade.timestamp,
+        rawSide: trade.side,
+        rawPrice: trade.price,
+        rawOutcomeIdx: trade.outcomeIdx,
+        decision: decision.action,
+        reason: decision.reason,
+        entryPrice: decision.entryPrice ?? null,
+        betOutcome: decision.betOutcome ?? null,
       })
-      .where(eq(strategies.id, strategy.id));
+      .returning({ id: signalsTable.id });
+    signalId = ins[0]?.id ?? null;
+  } catch (e) {
+    const msg = (e as Error).message || "";
+    if (msg.toLowerCase().includes("duplicate") || msg.toLowerCase().includes("unique")) {
+      state.nDuplicates += 1;
+      return;
+    }
+    throw e;
   }
 
-  return { nBetsAdded, nSkipped, nDuplicates };
+  if (decision.action === "bet" && signalId != null) {
+    await db.insert(positionsTable).values({
+      strategyId: state.strategy.id,
+      signalId,
+      marketCid: trade.conditionId,
+      side: trade.side,
+      entryPrice: decision.entryPrice,
+      betOutcome: decision.betOutcome,
+      stake: state.strategy.stake,
+      entryTs: trade.timestamp,
+      plannedResolutionTs: marketResolutionTs,
+    });
+    state.cash -= state.strategy.stake;
+    state.cashSpent += state.strategy.stake;
+    state.nBetsAdded += 1;
+    state.betCountByMarket.set(
+      trade.conditionId,
+      (state.betCountByMarket.get(trade.conditionId) ?? 0) + 1,
+    );
+  } else {
+    state.nSkipped += 1;
+  }
 }
 
 async function runOnce(): Promise<{
@@ -354,6 +344,14 @@ async function runOnce(): Promise<{
   duplicates_skipped: number;
   positions_settled: number;
   cash_settled_in: number;
+  per_strategy: Array<{
+    id: string;
+    bets: number;
+    skipped: number;
+    duplicates: number;
+    settled: number;
+    cash_settled_in: number;
+  }>;
 }> {
   const strategiesList = await loadActiveStrategies();
   if (strategiesList.length === 0) {
@@ -367,11 +365,11 @@ async function runOnce(): Promise<{
       duplicates_skipped: 0,
       positions_settled: 0,
       cash_settled_in: 0,
+      per_strategy: [],
     };
   }
 
-  // Pick the earliest cursor across strategies; ensures all strategies see
-  // every trade since their last successful poll.
+  // Earliest cursor across strategies — ensures every strategy sees every trade.
   const cursor = strategiesList.reduce<number>(
     (acc, s) => Math.min(acc, s.lastPollTs ?? NOW_S() - 5 * 60),
     NOW_S(),
@@ -387,7 +385,6 @@ async function runOnce(): Promise<{
     if (r.makerAssetId === "0") tokensToLookup.add(r.takerAssetId);
     else if (r.takerAssetId === "0") tokensToLookup.add(r.makerAssetId);
   }
-  // Drop tokens already in cache (no-op on cold start, but cheap)
   for (const t of tokensToLookup) if (tokenCache.has(t)) tokensToLookup.delete(t);
 
   // Step 2: batch-fetch token -> market mappings
@@ -396,8 +393,6 @@ async function runOnce(): Promise<{
   // Step 3: collect distinct conditionIds that need resolution metadata
   const conditionIdsNeedingMeta = new Set<string>();
   for (const m of tokenMap.values()) conditionIdsNeedingMeta.add(m.conditionId);
-  // Drop conditionIds already known in DB with resolution_ts populated.
-  // Use inArray which handles parameter-typing correctly.
   if (conditionIdsNeedingMeta.size > 0) {
     const ids = Array.from(conditionIdsNeedingMeta);
     const existing = await db
@@ -421,7 +416,6 @@ async function runOnce(): Promise<{
   // Step 5: persist new market rows + populate cache
   for (const [tokenId, mm] of tokenMap.entries()) {
     const meta = metaMap.get(mm.conditionId);
-    // Look up existing DB row to preserve category/question
     const existing = await db
       .select()
       .from(markets)
@@ -477,14 +471,89 @@ async function runOnce(): Promise<{
     if (!market) continue;
     const t = decodeTrade(
       r,
-      new Map([
-        [tokenId, { conditionId: market.conditionId, outcomeIdx: market.outcomeIdx }],
-      ]),
+      new Map([[tokenId, { conditionId: market.conditionId, outcomeIdx: market.outcomeIdx }]]),
     );
     if (t) decoded.push(t);
   }
 
-  // For each strategy: process trades, settle resolved, snapshot
+  // Sort decoded chronologically (older first) — required for cap=N and for
+  // running-volume tracking to be meaningful.
+  decoded.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Step 7: build runtime state per strategy and load market metadata once
+  const states = await Promise.all(strategiesList.map(buildRuntimeState));
+
+  // Pre-load market metadata for all unique conditionIds in this batch.
+  const uniqueCids = Array.from(new Set(decoded.map((t) => t.conditionId)));
+  const marketMetaCache = new Map<
+    string,
+    {
+      category: string | null;
+      resolutionTs: number | null;
+      resolved: number;
+      runningVolumeUsdc: number;
+    }
+  >();
+  if (uniqueCids.length > 0) {
+    const rows = await db
+      .select()
+      .from(markets)
+      .where(inArray(markets.conditionId, uniqueCids));
+    for (const m of rows) {
+      marketMetaCache.set(m.conditionId, {
+        category: m.category ?? null,
+        resolutionTs: m.resolutionTimestamp ?? null,
+        resolved: m.resolved ?? 0,
+        runningVolumeUsdc: Number(m.runningVolumeUsdc ?? 0),
+      });
+    }
+  }
+
+  // Step 8: walk trades chronologically.
+  // For each trade: every strategy evaluates against the PRE-trade running
+  // volume. Then we bump the running volume by the trade's notional.
+  for (const trade of decoded) {
+    const meta = marketMetaCache.get(trade.conditionId);
+    const runningVolBefore = meta?.runningVolumeUsdc ?? 0;
+    const category = meta?.resolved ? null : meta?.category ?? null;
+    const resolutionTs = meta?.resolutionTs ?? null;
+
+    for (const state of states) {
+      await processStrategyTrade({
+        state,
+        trade,
+        marketResolutionTs: resolutionTs,
+        marketCategory: category,
+        marketRunningVolumeUsdc: runningVolBefore,
+      });
+    }
+
+    // Bump in-process cache and persist running volume.
+    const newVol = runningVolBefore + Number(trade.notionalUsd || 0);
+    if (meta) meta.runningVolumeUsdc = newVol;
+    else
+      marketMetaCache.set(trade.conditionId, {
+        category: null,
+        resolutionTs: null,
+        resolved: 0,
+        runningVolumeUsdc: newVol,
+      });
+  }
+
+  // Persist running-volume updates (one update per touched market)
+  for (const cid of uniqueCids) {
+    const m = marketMetaCache.get(cid);
+    if (!m) continue;
+    await db
+      .update(markets)
+      .set({
+        runningVolumeUsdc: m.runningVolumeUsdc,
+        updatedAt: new Date(),
+      })
+      .where(eq(markets.conditionId, cid));
+  }
+
+  // Step 9: persist cash deltas, settle resolved, take snapshot, advance cursor
   let totalBets = 0;
   let totalSkipped = 0;
   let totalDup = 0;
@@ -496,29 +565,59 @@ async function runOnce(): Promise<{
     if (Number.isFinite(ts) && ts > maxNewCursor) maxNewCursor = ts;
   }
 
-  for (const strat of strategiesList) {
-    const stratView = { ...strat, currentCash: Number(strat.currentCash) };
-    const { nBetsAdded, nSkipped, nDuplicates } = await processStrategyForTrades({
-      strategy: stratView,
-      decoded,
-    });
-    const settled = await settleResolvedOpenPositions({
-      strategyId: strat.id,
-      slippage: STRATEGY.params.slippage,
-    });
-    await takeDailySnapshot(strat.id);
+  const perStrategySummary: Array<{
+    id: string;
+    bets: number;
+    skipped: number;
+    duplicates: number;
+    settled: number;
+    cash_settled_in: number;
+  }> = [];
 
-    totalBets += nBetsAdded;
-    totalSkipped += nSkipped;
-    totalDup += nDuplicates;
+  for (const state of states) {
+    if (state.cashSpent > 0) {
+      await db
+        .update(strategies)
+        .set({
+          currentCash: sql`${strategies.currentCash} - ${state.cashSpent}`,
+          updatedAt: new Date(),
+        })
+        .where(eq(strategies.id, state.strategy.id));
+    }
+
+    const settled = await settleResolvedOpenPositions({
+      strategyId: state.strategy.id,
+      slippage: state.params.slippage,
+    });
+    await takeDailySnapshot(state.strategy.id);
+
+    totalBets += state.nBetsAdded;
+    totalSkipped += state.nSkipped;
+    totalDup += state.nDuplicates;
     totalSettled += settled.settled;
     totalSettleCash += settled.cashDelta;
+
+    perStrategySummary.push({
+      id: state.strategy.id,
+      bets: state.nBetsAdded,
+      skipped: state.nSkipped,
+      duplicates: state.nDuplicates,
+      settled: settled.settled,
+      cash_settled_in: settled.cashDelta,
+    });
 
     await db
       .update(strategies)
       .set({ lastPollTs: maxNewCursor, updatedAt: new Date() })
-      .where(eq(strategies.id, strat.id));
+      .where(eq(strategies.id, state.strategy.id));
   }
+
+  // Also advance cursor on retired strategies (they shouldn't fall behind in
+  // case they're re-activated; but they don't accumulate signals).
+  await db
+    .update(strategies)
+    .set({ lastPollTs: maxNewCursor, updatedAt: new Date() })
+    .where(ne(strategies.status, "active"));
 
   return {
     ok: true,
@@ -530,6 +629,7 @@ async function runOnce(): Promise<{
     duplicates_skipped: totalDup,
     positions_settled: totalSettled,
     cash_settled_in: totalSettleCash,
+    per_strategy: perStrategySummary,
   };
 }
 

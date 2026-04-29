@@ -40,6 +40,14 @@ export const markets = pgTable("markets", {
   payoutsJson: jsonb("payouts_json").$type<string[] | null>(),
   resolved: integer("resolved").notNull().default(0), // 0/1
   winnerOutcomeIdx: integer("winner_outcome_idx"),
+  /**
+   * Running cumulative on-chain USDC notional we've SEEN on this market across
+   * all polled trades, regardless of strategy. Used by the `max_market_volume`
+   * filter (we evaluate trades chronologically and bump this AFTER eval).
+   * Strategy-agnostic — shared across every strategy. Approximate; only
+   * counts trades since the cron started polling.
+   */
+  runningVolumeUsdc: doublePrecision("running_volume_usdc").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });

@@ -35,7 +35,7 @@ export default async function HomePage() {
         <h1 className="text-3xl font-semibold tracking-tight">Model leaderboard</h1>
         <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
           Paper-money trading strategies for Polymarket prediction markets. The cron polls
-          Goldsky every 5 minutes for new on-chain trades and applies each strategy's filter
+          Goldsky on schedule for new on-chain trades and applies each strategy&apos;s filter
           to virtual capital. <span className="font-medium text-foreground">No real money is ever placed.</span>
         </p>
       </section>
@@ -55,8 +55,8 @@ export default async function HomePage() {
           <CardHeader>
             <CardTitle>No strategies seeded yet</CardTitle>
             <CardDescription>
-              Run <code className="font-mono">pnpm seed</code> to insert the default
-              <code className="ml-1 font-mono">tighter_blanket_cap10_3day</code> strategy.
+              Run <code className="font-mono">pnpm seed</code> to insert the strategies
+              defined in <code className="font-mono">src/lib/strategy.ts</code>.
             </CardDescription>
           </CardHeader>
         </Card>

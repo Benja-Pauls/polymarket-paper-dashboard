@@ -31,7 +31,14 @@ export type StrategySummary = {
 };
 
 export async function listStrategies(): Promise<Strategy[]> {
-  return db.select().from(strategies).orderBy(desc(strategies.createdAt));
+  // Active first; within each status group, ordered by name for stability.
+  return db
+    .select()
+    .from(strategies)
+    .orderBy(
+      sql`case ${strategies.status} when 'active' then 0 when 'halted' then 1 else 2 end`,
+      strategies.name,
+    );
 }
 
 export async function getStrategy(id: string): Promise<Strategy | null> {

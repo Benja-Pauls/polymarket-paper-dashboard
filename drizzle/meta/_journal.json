@@ -8,6 +8,13 @@
       "when": 1777483766430,
       "tag": "0000_giant_stardust",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1777485669860,
+      "tag": "0001_sturdy_lorna_dane",
+      "breakpoints": true
     }
   ]
 }

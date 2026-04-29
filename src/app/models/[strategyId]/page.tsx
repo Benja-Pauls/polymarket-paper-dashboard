@@ -69,10 +69,9 @@ export default async function StrategyDetailPage({
           <div className="space-y-1">
             <h1 className="font-mono text-2xl font-semibold tracking-tight">{strategy.name}</h1>
             <p className="max-w-3xl text-sm text-muted-foreground">{strategy.description}</p>
-            <p className="text-[11px] font-mono text-muted-foreground">
-              {Object.entries(params_)
-                .map(([k, v]) => `${k}=${String(v)}`)
-                .join("  · ")}
+            <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+              id: {strategy.id} · stake ${Number(strategy.stake).toFixed(0)} · bankroll $
+              {Number(strategy.startingBankroll).toFixed(0)}
             </p>
           </div>
           <Badge
@@ -119,6 +118,7 @@ export default async function StrategyDetailPage({
           <TabsTrigger value="open">Open positions ({openPos.length})</TabsTrigger>
           <TabsTrigger value="signals">Recent signals ({recentSignals.length})</TabsTrigger>
           <TabsTrigger value="closed">Closed positions ({closedPos.length})</TabsTrigger>
+          <TabsTrigger value="params">Params</TabsTrigger>
           <TabsTrigger value="tripwires">Tripwires</TabsTrigger>
         </TabsList>
 
@@ -294,6 +294,27 @@ export default async function StrategyDetailPage({
           </Card>
         </TabsContent>
 
+        <TabsContent value="params" className="mt-4">
+          <Card className="border-border/60">
+            <CardHeader>
+              <CardTitle className="text-base">Strategy parameters</CardTitle>
+              <CardDescription>
+                Filter applied to every Goldsky-observed trade. Edit these in
+                <code className="ml-1 font-mono">src/lib/strategy.ts</code> and re-run
+                <code className="ml-1 font-mono">pnpm seed</code>.
+              </CardDescription>
+            </CardHeader>
+            <Separator />
+            <CardContent className="pt-6">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {Object.entries(params_).map(([k, v]) => (
+                  <ParamRow key={k} k={k} v={v} />
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
         <TabsContent value="tripwires" className="mt-4 space-y-4">
           <Card className="border-border/60">
             <CardHeader>
@@ -349,6 +370,27 @@ function Empty({ title, description }: { title: string; description: string }) {
     <div className="flex flex-col items-center justify-center gap-1 py-16 text-center">
       <p className="text-sm font-medium">{title}</p>
       <p className="max-w-md text-xs text-muted-foreground">{description}</p>
+    </div>
+  );
+}
+
+function ParamRow({ k, v }: { k: string; v: unknown }) {
+  let display: string;
+  if (Array.isArray(v)) {
+    display = v.length === 0 ? "[]" : v.join(", ");
+  } else if (v === null) {
+    display = "null (no filter)";
+  } else if (typeof v === "number") {
+    display = String(v);
+  } else {
+    display = String(v);
+  }
+  return (
+    <div className="flex items-baseline justify-between gap-3 rounded-md border border-border/40 bg-card/30 px-3 py-2">
+      <span className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+        {k}
+      </span>
+      <span className="font-mono text-xs text-foreground break-all">{display}</span>
     </div>
   );
 }

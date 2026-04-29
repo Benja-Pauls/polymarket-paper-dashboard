@@ -1,7 +1,9 @@
 // One-shot seed for the paper-money dashboard.
 //
-// 1. Inserts (or upserts) the strategy `tighter_blanket_cap10_3day`.
-// 2. Loads watched markets from scripts/seed_data.json (produced by
+// 1. Inserts (or upserts) each strategy in `STRATEGIES`.
+// 2. Marks any id in `RETIRED_STRATEGY_IDS` as retired (status='retired'),
+//    keeping its historical signals/positions for record.
+// 3. Loads watched markets from scripts/seed_data.json (produced by
 //    `scripts/export_seed.py`) and upserts them into the markets table.
 //
 // Usage:   pnpm seed
@@ -9,11 +11,11 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { sql } from "drizzle-orm";
+import { inArray, sql } from "drizzle-orm";
 
 import { db } from "../src/lib/db";
 import { strategies, markets } from "../src/lib/db/schema";
-import { STRATEGY } from "../src/lib/strategy";
+import { STRATEGIES, RETIRED_STRATEGY_IDS } from "../src/lib/strategy";
 
 type SeedRow = {
   condition_id: string;
@@ -49,35 +51,59 @@ async function main() {
     `[seed] loaded ${seed.watched_markets.length.toLocaleString()} markets from ${seedPath} (generated_at ${seed.generated_at})`,
   );
 
-  // 1. Upsert the strategy
-  const existing = await db.execute(sql`select id, current_cash from strategies where id = ${STRATEGY.id}`);
-  const isNew = (existing.rows ?? existing).length === 0;
-  await db
-    .insert(strategies)
-    .values({
-      id: STRATEGY.id,
-      name: STRATEGY.name,
-      description: STRATEGY.description,
-      paramsJson: STRATEGY.params,
-      startingBankroll: STRATEGY.startingBankroll,
-      currentCash: STRATEGY.startingBankroll,
-      stake: STRATEGY.stake,
-      status: "active",
-    })
-    .onConflictDoUpdate({
-      target: strategies.id,
-      set: {
-        description: STRATEGY.description,
-        paramsJson: STRATEGY.params,
-        stake: STRATEGY.stake,
-        updatedAt: new Date(),
-      },
-    });
-  console.log(
-    `[seed] strategy ${STRATEGY.id} ${isNew ? "created" : "updated"} (bankroll $${STRATEGY.startingBankroll}, stake $${STRATEGY.stake})`,
-  );
+  // 1. Upsert each active strategy
+  for (const cfg of STRATEGIES) {
+    const existing = await db.execute(
+      sql`select id, current_cash, status from strategies where id = ${cfg.id}`,
+    );
+    const rows = (existing.rows ?? existing) as Array<Record<string, unknown>>;
+    const isNew = rows.length === 0;
+    await db
+      .insert(strategies)
+      .values({
+        id: cfg.id,
+        name: cfg.name,
+        description: cfg.description,
+        paramsJson: cfg.params as unknown as Record<string, unknown>,
+        startingBankroll: cfg.startingBankroll,
+        currentCash: cfg.startingBankroll,
+        stake: cfg.stake,
+        status: cfg.active ? "active" : "retired",
+      })
+      .onConflictDoUpdate({
+        target: strategies.id,
+        set: {
+          name: cfg.name,
+          description: cfg.description,
+          paramsJson: cfg.params as unknown as Record<string, unknown>,
+          stake: cfg.stake,
+          // Don't overwrite currentCash on update — preserves accumulated P&L.
+          status: cfg.active ? "active" : "retired",
+          updatedAt: new Date(),
+        },
+      });
+    console.log(
+      `[seed]   strategy ${cfg.id} ${isNew ? "created" : "updated"} (status=${cfg.active ? "active" : "retired"}, bankroll $${cfg.startingBankroll}, stake $${cfg.stake})`,
+    );
+  }
 
-  // 2. Bulk upsert markets in batches (Postgres parameter limit ~65535)
+  // 2. Retire predecessor strategies (keeps their data, stops new signals)
+  if (RETIRED_STRATEGY_IDS.length > 0) {
+    const result = await db
+      .update(strategies)
+      .set({
+        status: "retired",
+        haltReason: "deprecated by multi-strategy refactor",
+        updatedAt: new Date(),
+      })
+      .where(inArray(strategies.id, RETIRED_STRATEGY_IDS))
+      .returning({ id: strategies.id });
+    if (result.length > 0) {
+      console.log(`[seed]   retired predecessor strategies: ${result.map((r) => r.id).join(", ")}`);
+    }
+  }
+
+  // 3. Bulk upsert markets in batches (Postgres parameter limit ~65535)
   const BATCH = 500;
   let total = 0;
   for (let i = 0; i < seed.watched_markets.length; i += BATCH) {
@@ -105,11 +131,13 @@ async function main() {
       });
     total += slice.length;
     if (i % 5000 === 0 || total === seed.watched_markets.length) {
-      console.log(`[seed]   upserted ${total.toLocaleString()} / ${seed.watched_markets.length.toLocaleString()} markets`);
+      console.log(
+        `[seed]   upserted ${total.toLocaleString()} / ${seed.watched_markets.length.toLocaleString()} markets`,
+      );
     }
   }
 
-  console.log(`[seed] done. ${total} markets in DB.`);
+  console.log(`[seed] done. ${total} markets in DB. ${STRATEGIES.length} strategies seeded.`);
 }
 
 main().catch((e) => {

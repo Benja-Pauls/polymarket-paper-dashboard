@@ -1,35 +1,150 @@
-// Strategy parameters for tighter_blanket_cap10_3day.
+// Multi-strategy paper-money configuration.
 //
-// Frozen post-forward-OOS validation 2026-04-28 (Bar 1 floor candidate):
-//   - mean ret/$ = +0.637 over 21-month test
-//   - bootstrap P5 = +$16.7K on $5K bankroll
-//   - top-1 conc 3.9%, 51 bets/mo, P_pos = 100%
-//   - robust to +5% additional slippage (P5 stays $14.1K)
-//   - leave-one-market-out P5 stays $13.6-15K
+// All strategies share these defaults:
+//   - $1000 starting bankroll, $10 stake/bet
+//   - cap=N per market chronologically
+//   - Bet only when:
+//       category in `categories`  AND
+//       entry_price ∈ [ep_lo, ep_hi)  AND
+//       time_to_resolution ≥ min_hours_to_res  AND
+//       (max_market_volume == null OR market_running_volume_usdc < max_market_volume)
+//                                      AND
+//       count of bets on this market < cap_per_market
 //
-// Source: scripts/live_monitor.py from polymarket-insider-detection.
-export const STRATEGY = {
-  id: "tighter_blanket_cap10_3day",
-  name: "tighter_blanket_cap10_3day",
-  description:
-    "Tighter blanket cap-10 strategy. Buy any tradeable_* market trade where entry_price ∈ [0.10, 0.40), ≥72h to resolution, capped at 10 bets per market chronologically. Validated as a Bar 1 (floor) candidate.",
-  startingBankroll: 1000,
-  stake: 10,
-  params: {
-    ep_lo: 0.1,
-    ep_hi: 0.4,
-    min_hours_to_res: 72,
-    cap_per_market: 10,
-    slippage: 0.02,
-  },
-} as const;
+// `baseline_v1` reproduces the original `tighter_blanket_cap10_3day` filter
+// for backward comparison.
 
+export type StrategyParams = {
+  /** Allowed market categories (subset of TRADEABLE_CATEGORIES). */
+  categories: string[];
+  /** Lower bound (inclusive) on entry price. */
+  ep_lo: number;
+  /** Upper bound (exclusive) on entry price. */
+  ep_hi: number;
+  /** Minimum hours from trade ts -> market resolution ts. */
+  min_hours_to_res: number;
+  /**
+   * Maximum cumulative on-chain notional volume (in USDC) seen on the market
+   * BEFORE this trade. Set null to disable.
+   */
+  max_market_volume: number | null;
+  /** Cap on bets per market (chronological). */
+  cap_per_market: number;
+  /** Slippage haircut on settlement. */
+  slippage: number;
+};
+
+export type StrategyConfig = {
+  id: string;
+  name: string;
+  description: string;
+  startingBankroll: number;
+  stake: number;
+  active: boolean;
+  params: StrategyParams;
+};
+
+/** Categories the cron will track. Strategies opt in via `params.categories`. */
 export const TRADEABLE_CATEGORIES = new Set([
   "tradeable_geopolitical",
   "tradeable_political",
   "tradeable_corporate",
   "tradeable_crypto",
 ]);
+
+const ALL_TRADEABLE_CATEGORIES = [
+  "tradeable_geopolitical",
+  "tradeable_political",
+  "tradeable_corporate",
+  "tradeable_crypto",
+];
+
+/**
+ * Currently-tracked strategies. Add new ones here, then run `pnpm seed` to
+ * upsert into the strategies table. Set `active: false` to retire a strategy
+ * (it stops accumulating new signals/positions but historical rows are kept).
+ */
+export const STRATEGIES: StrategyConfig[] = [
+  {
+    id: "geo_deep_longshot_v1",
+    name: "GEO Deep Longshot",
+    description:
+      "Geopolitical-only deep-longshot. Bet entry_price ∈ [0.05, 0.15) on tradeable_geopolitical markets, ≥24h to resolution, cap=20, market_cum_usdc_before < $100K. BAR 2 ALPHA-TIER: in-sample 21mo P5 = +$97K, forward-OOS 4mo mean ret/$ +1.25.",
+    startingBankroll: 1000,
+    stake: 10,
+    active: true,
+    params: {
+      categories: ["tradeable_geopolitical"],
+      ep_lo: 0.05,
+      ep_hi: 0.15,
+      min_hours_to_res: 24,
+      max_market_volume: 100_000,
+      cap_per_market: 20,
+      slippage: 0.02,
+    },
+  },
+  {
+    id: "all_cat_tight_v1",
+    name: "All-Cat Tight",
+    description:
+      "All tradeable_* with ep ∈ [0.10, 0.15), cap=5, ≥72h, vol<$100K. BAR 2 ALPHA: in-sample mean +0.99, forward +1.12.",
+    startingBankroll: 1000,
+    stake: 10,
+    active: true,
+    params: {
+      categories: ALL_TRADEABLE_CATEGORIES,
+      ep_lo: 0.1,
+      ep_hi: 0.15,
+      min_hours_to_res: 72,
+      max_market_volume: 100_000,
+      cap_per_market: 5,
+      slippage: 0.02,
+    },
+  },
+  {
+    id: "all_cat_conservative_v1",
+    name: "All-Cat Conservative",
+    description:
+      "All tradeable_* with ep ∈ [0.10, 0.20), cap=10, ≥72h, vol<$100K. Bar-1 floor: in-sample +0.76, forward +0.91.",
+    startingBankroll: 1000,
+    stake: 10,
+    active: true,
+    params: {
+      categories: ALL_TRADEABLE_CATEGORIES,
+      ep_lo: 0.1,
+      ep_hi: 0.2,
+      min_hours_to_res: 72,
+      max_market_volume: 100_000,
+      cap_per_market: 10,
+      slippage: 0.02,
+    },
+  },
+  {
+    id: "baseline_v1",
+    name: "Baseline (for comparison)",
+    description:
+      "Original tighter_blanket_cap10_3day: ep ∈ [0.10, 0.40), cap=10, ≥72h. No volume filter. Kept for comparison vs the improvements.",
+    startingBankroll: 1000,
+    stake: 10,
+    active: true,
+    params: {
+      categories: ALL_TRADEABLE_CATEGORIES,
+      ep_lo: 0.1,
+      ep_hi: 0.4,
+      min_hours_to_res: 72,
+      max_market_volume: null,
+      cap_per_market: 10,
+      slippage: 0.02,
+    },
+  },
+];
+
+/**
+ * Strategy id of the predecessor that should be retired (status -> 'retired')
+ * when seed runs. We keep its rows for historical comparison but it stops
+ * receiving new signals.
+ */
+export const RETIRED_STRATEGY_IDS: string[] = ["tighter_blanket_cap10_3day"];
 
 export type TradeInput = {
   rawTradeId: string;
@@ -58,20 +173,32 @@ export type EvalDecision =
     };
 
 /**
- * Apply the strategy filter to a single trade. Mirrors evaluate_trade() in
- * scripts/live_monitor.py.
+ * Apply one strategy's filter to a single trade.
  */
 export function evaluateTrade(args: {
   trade: TradeInput;
   marketResolutionTs: number | null;
   marketCategory: string | null;
+  /**
+   * Cumulative on-chain USDC notional on this market BEFORE this trade.
+   * Pass null when not tracking; the volume filter is then a no-op (passes).
+   */
+  marketRunningVolumeUsdc: number | null;
   marketBetCount: number;
   cash: number;
   stake: number;
-  params: typeof STRATEGY.params;
+  params: StrategyParams;
 }): EvalDecision {
-  const { trade, marketResolutionTs, marketCategory, marketBetCount, cash, stake, params } =
-    args;
+  const {
+    trade,
+    marketResolutionTs,
+    marketCategory,
+    marketRunningVolumeUsdc,
+    marketBetCount,
+    cash,
+    stake,
+    params,
+  } = args;
 
   const side = String(trade.side || "").toUpperCase();
   if (side !== "BUY" && side !== "SELL") {
@@ -95,10 +222,10 @@ export function evaluateTrade(args: {
   if (marketCategory == null) {
     return { action: "skip", reason: "market not in tradeable_*", entryPrice, betOutcome };
   }
-  if (!TRADEABLE_CATEGORIES.has(marketCategory)) {
+  if (!params.categories.includes(marketCategory)) {
     return {
       action: "skip",
-      reason: `category=${marketCategory} not tradeable_*`,
+      reason: `category=${marketCategory} not in strategy whitelist`,
       entryPrice,
       betOutcome,
     };
@@ -124,6 +251,18 @@ export function evaluateTrade(args: {
     return {
       action: "skip",
       reason: `hours_to_res=${hoursToRes.toFixed(1)} < ${params.min_hours_to_res}`,
+      entryPrice,
+      betOutcome,
+    };
+  }
+  if (
+    params.max_market_volume != null &&
+    marketRunningVolumeUsdc != null &&
+    marketRunningVolumeUsdc >= params.max_market_volume
+  ) {
+    return {
+      action: "skip",
+      reason: `market vol $${marketRunningVolumeUsdc.toFixed(0)} ≥ cap $${params.max_market_volume}`,
       entryPrice,
       betOutcome,
     };
@@ -158,7 +297,6 @@ export function evaluateTrade(args: {
 /**
  * Settle a position when its market has resolved.
  *
- * Mirrors settle_resolved_positions() in live_monitor.py:
  *   payoff = stake / entry_price if won else 0
  *   payout = payoff * (1 - slippage) if won else 0
  *   realized_return = (1 - entry_price) / entry_price - slippage if won
@@ -182,7 +320,7 @@ export function settlePosition(args: {
   return { won, payout: 0, realizedReturn: -1 - slippage };
 }
 
-// Tripwire thresholds (mirror DEFAULT_TRIPWIRES in live_monitor.py).
+// Tripwire thresholds applied uniformly to every strategy.
 export const TRIPWIRES = {
   maxCumulativeLossPct: 0.3,
   maxWeeklyLossPct: 0.2,
