@@ -56,6 +56,13 @@ export type DecodedTrade = {
   wallet: string; // the trader (maker if maker-side, taker if taker-side)
   makerWallet: string;
   takerWallet: string;
+  // Optional metadata from data-api /trades. Free fields the data-api gives us
+  // per trade — useful for lazy-classify (so we don't have to round-trip Gamma
+  // for question text). Goldsky does NOT provide these, so they're null when
+  // the source is the legacy goldsky decode path.
+  title?: string | null;
+  slug?: string | null;
+  eventSlug?: string | null;
 };
 
 class GoldskyError extends Error {}

@@ -44,11 +44,6 @@ import {
   type StrategyParams,
 } from "@/lib/strategy";
 import { classifyMany, lookupStaticLabel } from "@/lib/classify";
-import {
-  fetchMarketsByConditions,
-  parseEndTs,
-  GammaUnreachableError,
-} from "@/lib/gamma";
 
 export const runtime = "nodejs";
 export const maxDuration = 300; // 5 minutes
@@ -501,14 +496,17 @@ async function runOnce(): Promise<{
   // strategy then skips with "market not in tradeable_*". To unblock this:
   //   1. Try the static label index (free, ~15.5K markets in the research
   //      tradability parquet).
-  //   2. If still null, batch-fetch question text from Gamma for the unique
-  //      newly-seen condition_ids and classify with Claude Haiku 4.5
-  //      (~$0.0001/market, capped at $5/run).
-  //   3. Update the markets row in-place. Also patch the tokenCache so the
-  //      strategies in this same cron invocation see the category.
+  //   2. If still null, classify with Claude Haiku 4.5 (~$0.0001/market) using
+  //      the `title` field that data-api /trades returned for free with each
+  //      trade. We previously round-tripped Gamma here but Gamma's
+  //      `?conditionIds=` filter is silently ignored (returns random markets)
+  //      so 100% of LLM calls were getting null question text and skipping.
+  //   3. Persist (category, question_text) onto the markets row. The 6-hour
+  //      sync-open-markets cron supplies endDate from Gamma's paginated
+  //      `?active=true&closed=false` endpoint (which DOES work).
   //
-  // Cost ceiling: at typical 15-min poll cadence we see <100 new markets per
-  // run; budget is generous.
+  // Cost ceiling: at typical 15-min poll cadence we see <500 new markets per
+  // run; ANTHROPIC budget cap of $1/poll handles ~5,000 calls.
   const cidsNeedingCategory = new Set<string>();
   for (const entry of marketCache.values()) {
     if (!entry) continue;
@@ -537,67 +535,78 @@ async function runOnce(): Promise<{
   console.log(
     `[cron] lazy-classify: ${cidsNeedingCategory.size} markets need category`,
   );
+  // Build cid -> title map from the trades we just fetched. Pick the longest
+  // title we see (some trades have empty titles for legacy reasons).
+  const cidToTitle = new Map<string, string>();
+  for (const t of decoded) {
+    const title = (t.title ?? "").trim();
+    if (!title) continue;
+    const prev = cidToTitle.get(t.conditionId);
+    if (!prev || title.length > prev.length) cidToTitle.set(t.conditionId, title);
+  }
   // Free pass via static label index first.
-  const lazyResolutions = new Map<string, { category: string | null; endTs: number | null }>();
+  const lazyResolutions = new Map<
+    string,
+    { category: string | null; endTs: number | null; question: string | null }
+  >();
   for (const cid of cidsNeedingCategory) {
     const cat = lookupStaticLabel(cid);
+    const q = cidToTitle.get(cid) ?? null;
     if (cat) {
-      lazyResolutions.set(cid, { category: cat, endTs: null });
+      lazyResolutions.set(cid, { category: cat, endTs: null, question: q });
     }
   }
-  // LLM-classify the rest if Anthropic key + Gamma reachable.
+  // LLM-classify the rest using the trade-bundled titles. No Gamma round-trip.
   const stillUnclassified = Array.from(cidsNeedingCategory).filter(
     (c) => !lazyResolutions.has(c),
   );
+  const llmInput: Array<{ conditionId: string; question: string | null }> = [];
+  for (const cid of stillUnclassified) {
+    const q = cidToTitle.get(cid);
+    if (q) llmInput.push({ conditionId: cid, question: q });
+    // Stash question even if no LLM key, so we still persist it.
+    lazyResolutions.set(cid, {
+      category: null,
+      endTs: null,
+      question: q ?? null,
+    });
+  }
   console.log(
-    `[cron] lazy-classify: ${lazyResolutions.size} from static labels, ${stillUnclassified.length} need Gamma+LLM`,
+    `[cron] lazy-classify: ${lazyResolutions.size - llmInput.length} from static labels, ${llmInput.length} need LLM (out of ${cidsNeedingCategory.size} total need-category)`,
   );
-  if (stillUnclassified.length > 0 && process.env.ANTHROPIC_API_KEY) {
+  if (llmInput.length > 0 && process.env.ANTHROPIC_API_KEY) {
     try {
-      // Batch-fetch question text + endDate from Gamma.
-      const gammaMap = await fetchMarketsByConditions({
-        conditionIds: stillUnclassified,
+      const llmOut = await classifyMany({
+        items: llmInput,
+        concurrency: 8,
+        // Lower budget per poll (we run every 15 min) than per sync (every 6h).
+        budgetUsd: 1,
       });
-      const llmInput: Array<{ conditionId: string; question: string | null }> = [];
-      for (const cid of stillUnclassified) {
-        const g = gammaMap.get(cid);
-        if (!g) continue;
-        const endTs = parseEndTs(g.endDate);
-        // Stash endTs early so we update resolution_timestamp even if LLM
-        // call fails or times out.
-        lazyResolutions.set(cid, { category: null, endTs });
-        if ((g.question ?? "").trim()) {
-          llmInput.push({ conditionId: cid, question: g.question });
-        }
-      }
-      if (llmInput.length > 0) {
-        const llmOut = await classifyMany({
-          items: llmInput,
-          concurrency: 8,
-          // Lower budget per poll (we run every 15 min) than per sync (every 6h).
-          budgetUsd: 1,
-        });
-        for (const [cid, cat] of llmOut.entries()) {
-          const prev = lazyResolutions.get(cid) ?? { category: null, endTs: null };
-          lazyResolutions.set(cid, { category: cat, endTs: prev.endTs });
-        }
+      for (const [cid, cat] of llmOut.entries()) {
+        const prev = lazyResolutions.get(cid) ?? {
+          category: null,
+          endTs: null,
+          question: cidToTitle.get(cid) ?? null,
+        };
+        lazyResolutions.set(cid, { ...prev, category: cat });
       }
     } catch (e) {
-      if (e instanceof GammaUnreachableError) {
-        console.warn(`[cron] gamma unreachable for lazy-classify; skipping LLM step`);
-      } else {
-        console.warn(`[cron] lazy-classify failed:`, (e as Error).message);
-      }
+      console.warn(`[cron] lazy-classify LLM failed:`, (e as Error).message);
     }
   }
-  // Persist the resolved categories + resolution timestamps. Also patch
-  // marketCache so strategies see the category in this same invocation.
+  // Persist the resolved categories + question text. Also patch marketCache
+  // so strategies see the category in this same invocation. resolution_ts
+  // for these markets comes from the 6h sync-open-markets cron.
   for (const [cid, info] of lazyResolutions.entries()) {
-    if (info.category == null && info.endTs == null) continue;
+    if (info.category == null && info.question == null && info.endTs == null) continue;
     await db
       .update(markets)
       .set({
         category: info.category != null ? info.category : sql`${markets.category}`,
+        questionText:
+          info.question != null
+            ? sql`coalesce(${markets.questionText}, ${info.question})`
+            : sql`${markets.questionText}`,
         resolutionTimestamp:
           info.endTs != null
             ? sql`coalesce(${markets.resolutionTimestamp}, ${info.endTs})`

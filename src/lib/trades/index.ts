@@ -37,6 +37,12 @@ type DataApiTrade = {
   timestamp: number; // unix seconds
   outcomeIndex: number; // 0 or 1
   transactionHash: string;
+  // Free metadata included in the data-api payload — we propagate these into
+  // DecodedTrade so the cron can lazy-classify (and persist question_text)
+  // without round-tripping Gamma (which silently ignores conditionIds=).
+  title?: string | null;
+  slug?: string | null;
+  eventSlug?: string | null;
 };
 
 class TradesApiError extends Error {}
@@ -137,6 +143,11 @@ export async function fetchTradesSinceFromDataApi(args: {
       wallet: String(r.proxyWallet).toLowerCase(),
       makerWallet: String(r.proxyWallet).toLowerCase(),
       takerWallet: String(r.proxyWallet).toLowerCase(),
+      // Pass through the free metadata; cron uses this for lazy-classify +
+      // persisting question_text. Some old fills may lack title; default null.
+      title: typeof r.title === "string" ? r.title : null,
+      slug: typeof r.slug === "string" ? r.slug : null,
+      eventSlug: typeof r.eventSlug === "string" ? r.eventSlug : null,
     };
   });
 
