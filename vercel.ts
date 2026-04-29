@@ -5,14 +5,19 @@ import { type VercelConfig } from "@vercel/config/v1";
 export const config: VercelConfig = {
   framework: "nextjs",
   // Vercel Cron Jobs:
-  // - Hobby plan minimum interval: daily.
-  // - Pro plan minimum interval: 1 minute.
-  // We schedule every 5 minutes ("*/5 * * * *"); on Hobby this falls back
-  // to "first run of each day" — see README.md for details.
+  //  - Hobby plan minimum interval: daily.
+  //  - Pro plan minimum interval: 1 minute.
+  //
+  // For useful live paper-trading at "every 5 min" granularity, upgrade to
+  // Pro and change `schedule` to "*/5 * * * *". The endpoint is idempotent;
+  // the only thing that changes is how often cap-10 chronological filling
+  // sees fresh trades.
   crons: [
     {
       path: "/api/cron/poll",
-      schedule: "*/5 * * * *",
+      // Once a day at 14:30 UTC. Hobby plan max frequency.
+      // Bump to "*/5 * * * *" after upgrading to Pro.
+      schedule: "30 14 * * *",
     },
   ],
 };

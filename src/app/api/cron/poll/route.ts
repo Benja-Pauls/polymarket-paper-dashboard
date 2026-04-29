@@ -28,8 +28,9 @@ import {
 } from "@/lib/db/schema";
 import {
   decodeTrade,
-  fetchMarketForToken,
   fetchMarketMetadata,
+  fetchMarketMetadataBatch,
+  fetchMarketsForTokens,
   fetchTradesSince,
   type DecodedTrade,
 } from "@/lib/goldsky";
@@ -70,79 +71,6 @@ function isAuthorized(req: Request): boolean {
 
 async function loadActiveStrategies(): Promise<Strategy[]> {
   return db.select().from(strategies).where(eq(strategies.status, "active"));
-}
-
-async function resolveTokenToMarket(
-  tokenId: string,
-): Promise<MarketCacheEntry | null> {
-  if (tokenCache.has(tokenId)) return tokenCache.get(tokenId)!;
-
-  // Try the activity subgraph reverse lookup. We only need this once per
-  // (token, deployment) — once the market is in our DB, we'll find it
-  // via the cache on subsequent hits.
-  let lookup: Awaited<ReturnType<typeof fetchMarketForToken>> = null;
-  try {
-    lookup = await fetchMarketForToken({ tokenId });
-  } catch (e) {
-    console.warn(`[cron] activity lookup failed for token ${tokenId}: ${(e as Error).message}`);
-  }
-  if (!lookup) {
-    tokenCache.set(tokenId, null);
-    return null;
-  }
-
-  // Check whether this market is in our watched-markets DB; if so, get its
-  // category. If not, fetch the question/category isn't trivially available
-  // here — we record the market with category=null and resolved=0; downstream
-  // strategy filter will skip it (because tradeable_* check fails).
-  const existing = await db
-    .select()
-    .from(markets)
-    .where(eq(markets.conditionId, lookup.conditionId))
-    .limit(1);
-  let category: string | null = null;
-  let resolved: 0 | 1 = lookup.winnerOutcomeIdx != null ? 1 : 0;
-
-  if (existing.length > 0) {
-    category = existing[0].category;
-    // If our DB says resolved but activity-subgraph says not yet (or vice versa),
-    // trust the live activity-subgraph reading.
-    resolved = (lookup.winnerOutcomeIdx != null ? 1 : existing[0].resolved) as 0 | 1;
-  }
-
-  // Upsert resolution_timestamp / payouts / winner from live data so we
-  // converge our DB toward the truth.
-  await db
-    .insert(markets)
-    .values({
-      conditionId: lookup.conditionId,
-      category,
-      resolutionTimestamp: lookup.resolutionTimestamp,
-      payoutsJson: lookup.payouts,
-      resolved,
-      winnerOutcomeIdx: lookup.winnerOutcomeIdx,
-    })
-    .onConflictDoUpdate({
-      target: markets.conditionId,
-      set: {
-        resolutionTimestamp: lookup.resolutionTimestamp,
-        payoutsJson: lookup.payouts,
-        resolved,
-        winnerOutcomeIdx: lookup.winnerOutcomeIdx,
-        updatedAt: new Date(),
-      },
-    });
-
-  const entry: MarketCacheEntry = {
-    conditionId: lookup.conditionId,
-    category,
-    resolutionTimestamp: lookup.resolutionTimestamp,
-    resolved,
-    winnerOutcomeIdx: lookup.winnerOutcomeIdx,
-    outcomeIdx: lookup.outcomeIdx,
-  };
-  tokenCache.set(tokenId, entry);
-  return entry;
 }
 
 async function settleResolvedOpenPositions(args: {
@@ -318,8 +246,8 @@ async function processStrategyForTrades(args: {
     let marketRow = mr[0];
 
     if (!marketRow) {
-      // We have a token cache hit (otherwise we wouldn't have decoded), but
-      // the market is new. resolveTokenToMarket already upserted it.
+      // We have a token cache hit (otherwise we wouldn't have decoded), so
+      // the upsert in step 5 of runOnce already wrote this market — re-read.
       const re = await db
         .select()
         .from(markets)
@@ -450,20 +378,101 @@ async function runOnce(): Promise<{
   );
   const safeCursor = cursor > 0 ? cursor : NOW_S() - 5 * 60;
 
-  // Fetch new trades
-  const raw = await fetchTradesSince({ sinceTs: safeCursor, maxRows: 5000, maxPages: 6 });
+  // Fetch new trades. Cap at 2000 / 4 pages to keep within the 300s budget.
+  const raw = await fetchTradesSince({ sinceTs: safeCursor, maxRows: 2000, maxPages: 4 });
 
-  // Decode (lookup tokens via activity subgraph as needed)
+  // Step 1: collect distinct token ids that need lookup
+  const tokensToLookup = new Set<string>();
+  for (const r of raw) {
+    if (r.makerAssetId === "0") tokensToLookup.add(r.takerAssetId);
+    else if (r.takerAssetId === "0") tokensToLookup.add(r.makerAssetId);
+  }
+  // Drop tokens already in cache (no-op on cold start, but cheap)
+  for (const t of tokensToLookup) if (tokenCache.has(t)) tokensToLookup.delete(t);
+
+  // Step 2: batch-fetch token -> market mappings
+  const tokenMap = await fetchMarketsForTokens({ tokenIds: Array.from(tokensToLookup) });
+
+  // Step 3: collect distinct conditionIds that need resolution metadata
+  const conditionIdsNeedingMeta = new Set<string>();
+  for (const m of tokenMap.values()) conditionIdsNeedingMeta.add(m.conditionId);
+  // Drop conditionIds already known in DB with resolution_ts populated
+  if (conditionIdsNeedingMeta.size > 0) {
+    const existing = await db
+      .select({
+        cid: markets.conditionId,
+        resTs: markets.resolutionTimestamp,
+      })
+      .from(markets)
+      .where(sql`${markets.conditionId} = ANY(${Array.from(conditionIdsNeedingMeta)})`);
+    for (const { cid, resTs } of existing) {
+      if (resTs != null) conditionIdsNeedingMeta.delete(cid);
+    }
+  }
+
+  // Step 4: batch-fetch resolution metadata
+  const metaMap =
+    conditionIdsNeedingMeta.size > 0
+      ? await fetchMarketMetadataBatch({ conditionIds: Array.from(conditionIdsNeedingMeta) })
+      : new Map();
+
+  // Step 5: persist new market rows + populate cache
+  for (const [tokenId, mm] of tokenMap.entries()) {
+    const meta = metaMap.get(mm.conditionId);
+    // Look up existing DB row to preserve category/question
+    const existing = await db
+      .select()
+      .from(markets)
+      .where(eq(markets.conditionId, mm.conditionId))
+      .limit(1);
+    const exRow = existing[0];
+    const category = exRow?.category ?? null;
+    const resolutionTs = meta?.resolutionTimestamp ?? exRow?.resolutionTimestamp ?? null;
+    const winnerIdx = meta?.winnerOutcomeIdx ?? exRow?.winnerOutcomeIdx ?? null;
+    const payouts = meta?.payouts ?? (exRow?.payoutsJson ?? null);
+    const resolved: 0 | 1 = winnerIdx != null ? 1 : ((exRow?.resolved ?? 0) as 0 | 1);
+
+    if (!exRow || meta != null) {
+      await db
+        .insert(markets)
+        .values({
+          conditionId: mm.conditionId,
+          category,
+          resolutionTimestamp: resolutionTs,
+          payoutsJson: payouts as string[] | null,
+          resolved,
+          winnerOutcomeIdx: winnerIdx,
+        })
+        .onConflictDoUpdate({
+          target: markets.conditionId,
+          set: {
+            resolutionTimestamp: resolutionTs,
+            payoutsJson: payouts as string[] | null,
+            resolved,
+            winnerOutcomeIdx: winnerIdx,
+            updatedAt: new Date(),
+          },
+        });
+    }
+    tokenCache.set(tokenId, {
+      conditionId: mm.conditionId,
+      category,
+      resolutionTimestamp: resolutionTs,
+      resolved,
+      winnerOutcomeIdx: winnerIdx,
+      outcomeIdx: mm.outcomeIdx,
+    });
+  }
+
+  // Step 6: decode trades
   const decoded: DecodedTrade[] = [];
   for (const r of raw) {
     let tokenId: string | null = null;
     if (r.makerAssetId === "0") tokenId = r.takerAssetId;
     else if (r.takerAssetId === "0") tokenId = r.makerAssetId;
     if (!tokenId) continue;
-
-    const market = await resolveTokenToMarket(tokenId);
+    const market = tokenCache.get(tokenId);
     if (!market) continue;
-
     const t = decodeTrade(
       r,
       new Map([

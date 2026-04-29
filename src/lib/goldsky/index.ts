@@ -146,9 +146,13 @@ export async function fetchTradesSince(args: {
 }
 
 /**
- * Fetch a market's metadata from the activity subgraph by condition_id.
- * Returns resolution_timestamp, payouts (set when resolved), and the
- * token_to_outcome map.
+ * Fetch a market's resolution metadata from `orderbook_resync.condition`.
+ * That subgraph froze around Jan 5 2026 — markets created BEFORE that date
+ * are present, markets created AFTER are not. For frozen markets we get
+ * `resolutionTimestamp`, `payouts`, and the winner.
+ *
+ * For post-freeze markets we fall back to scanning `activity-subgraph`
+ * Redemption events; presence of any redemption implies resolution.
  */
 export async function fetchMarketMetadata(args: {
   conditionId: string;
@@ -157,64 +161,162 @@ export async function fetchMarketMetadata(args: {
   resolutionTimestamp: number | null;
   payouts: string[] | null;
   winnerOutcomeIdx: number | null;
-  tokenToOutcome: Record<string, number>;
 } | null> {
-  const url = SUBGRAPHS.activity;
-  const query = `query Cond($id: ID!) {
+  // Primary: orderbook_resync.condition has resolutionTimestamp + payouts.
+  const q1 = `query Cond($id: ID!) {
     condition(id: $id) {
       id
       resolutionTimestamp
       payouts
       outcomeSlotCount
-      positionIds
+      payoutDenominator
     }
   }`;
-  const data = (await gqlPost(url, query, { id: args.conditionId.toLowerCase() }, args.signal)) as
-    | {
-        condition?: {
-          id: string;
-          resolutionTimestamp?: string | null;
-          payouts?: string[] | null;
-          outcomeSlotCount?: number | null;
-          positionIds?: string[] | null;
-        } | null;
-      }
-    | null;
-  const c = data?.condition;
-  if (!c) return null;
-
-  const resTs = c.resolutionTimestamp != null ? Number(c.resolutionTimestamp) : null;
-  const payouts = c.payouts ?? null;
+  let resTs: number | null = null;
+  let payouts: string[] | null = null;
   let winner: number | null = null;
-  if (payouts && payouts.length >= 2) {
-    for (let i = 0; i < payouts.length; i++) {
-      const v = Number(payouts[i]);
-      if (Number.isFinite(v) && v > 0.5) {
-        winner = i;
-        break;
+  try {
+    const data = (await gqlPost(SUBGRAPHS.orderbook_resync, q1, { id: args.conditionId }, args.signal)) as
+      | {
+          condition?: {
+            id: string;
+            resolutionTimestamp?: string | null;
+            payouts?: string[] | null;
+            payoutDenominator?: string | null;
+          } | null;
+        }
+      | null;
+    const c = data?.condition;
+    if (c) {
+      resTs = c.resolutionTimestamp != null ? Number(c.resolutionTimestamp) : null;
+      payouts = c.payouts ?? null;
+      if (payouts && payouts.length >= 2) {
+        for (let i = 0; i < payouts.length; i++) {
+          const v = Number(payouts[i]);
+          if (Number.isFinite(v) && v > 0.5) {
+            winner = i;
+            break;
+          }
+        }
       }
+    }
+  } catch {
+    // continue to fallback
+  }
+
+  // Fallback: activity-subgraph Redemption (resolution timestamp + payout)
+  if (resTs == null || winner == null) {
+    const q2 = `query Red($cond: String!) {
+      redemptions(first: 1, where: { condition: $cond }, orderBy: timestamp, orderDirection: asc) {
+        timestamp
+        payout
+      }
+    }`;
+    try {
+      const d2 = (await gqlPost(SUBGRAPHS.activity, q2, { cond: args.conditionId }, args.signal)) as {
+        redemptions?: Array<{ timestamp: string; payout: string }>;
+      } | null;
+      const r = d2?.redemptions?.[0];
+      if (r) {
+        const ts = Number(r.timestamp);
+        if (Number.isFinite(ts) && ts > 0 && resTs == null) resTs = ts;
+        // We can't determine winner outcome from a single redemption alone
+        // (it's per-redeemer). Leave winner null; settlement will retry.
+      }
+    } catch {
+      // give up
     }
   }
 
-  // positionIds is the list of token IDs in outcome order: [YES_token, NO_token].
-  const tokenToOutcome: Record<string, number> = {};
-  if (c.positionIds && Array.isArray(c.positionIds)) {
-    c.positionIds.forEach((tid, idx) => {
-      if (tid) tokenToOutcome[String(tid)] = idx;
-    });
-  }
+  if (resTs == null && payouts == null && winner == null) return null;
 
   return {
     resolutionTimestamp: resTs && Number.isFinite(resTs) && resTs > 0 ? resTs : null,
     payouts,
     winnerOutcomeIdx: winner,
-    tokenToOutcome,
   };
 }
 
 /**
- * Reverse-lookup: given a token id (positionId), find its market.
- * Returns null if the token isn't on a Condition we know about.
+ * Batched fetch of resolution metadata for many condition_ids.
+ * Returns map of conditionId -> {resolutionTimestamp, payouts, winnerOutcomeIdx}.
+ */
+export async function fetchMarketMetadataBatch(args: {
+  conditionIds: string[];
+  signal?: AbortSignal;
+}): Promise<
+  Map<
+    string,
+    {
+      resolutionTimestamp: number | null;
+      payouts: string[] | null;
+      winnerOutcomeIdx: number | null;
+    }
+  >
+> {
+  const out = new Map<
+    string,
+    {
+      resolutionTimestamp: number | null;
+      payouts: string[] | null;
+      winnerOutcomeIdx: number | null;
+    }
+  >();
+  const unique = Array.from(new Set(args.conditionIds.filter(Boolean)));
+  if (unique.length === 0) return out;
+
+  const CHUNK = 100;
+  const q = `query Conds($ids: [ID!]!) {
+    conditions(first: 1000, where: { id_in: $ids }) {
+      id
+      resolutionTimestamp
+      payouts
+    }
+  }`;
+
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const batch = unique.slice(i, i + CHUNK);
+    try {
+      const data = (await gqlPost(
+        SUBGRAPHS.orderbook_resync,
+        q,
+        { ids: batch },
+        args.signal,
+      )) as {
+        conditions?: Array<{
+          id: string;
+          resolutionTimestamp?: string | null;
+          payouts?: string[] | null;
+        }>;
+      } | null;
+      for (const c of data?.conditions ?? []) {
+        const resTs = c.resolutionTimestamp != null ? Number(c.resolutionTimestamp) : null;
+        let winner: number | null = null;
+        if (c.payouts && c.payouts.length >= 2) {
+          for (let j = 0; j < c.payouts.length; j++) {
+            const v = Number(c.payouts[j]);
+            if (Number.isFinite(v) && v > 0.5) {
+              winner = j;
+              break;
+            }
+          }
+        }
+        out.set(String(c.id), {
+          resolutionTimestamp: resTs && Number.isFinite(resTs) && resTs > 0 ? resTs : null,
+          payouts: c.payouts ?? null,
+          winnerOutcomeIdx: winner,
+        });
+      }
+    } catch {
+      // tolerate
+    }
+  }
+  return out;
+}
+
+/**
+ * Reverse-lookup: given a token id (positionId), find its conditionId and
+ * outcome index. Uses the orderbook subgraph's `MarketData` entity.
  */
 export async function fetchMarketForToken(args: {
   tokenId: string;
@@ -222,54 +324,69 @@ export async function fetchMarketForToken(args: {
 }): Promise<{
   conditionId: string;
   outcomeIdx: number;
-  resolutionTimestamp: number | null;
-  payouts: string[] | null;
-  winnerOutcomeIdx: number | null;
 } | null> {
-  const url = SUBGRAPHS.activity;
-  // Activity subgraph has positionId -> Condition reverse lookup via the
-  // Condition.positionIds field; we filter conditions where positionIds
-  // contains the token.
-  const query = `query Tok($tokenId: String!) {
-    conditions(first: 1, where: { positionIds_contains: [$tokenId] }) {
+  const out = await fetchMarketsForTokens({
+    tokenIds: [args.tokenId],
+    signal: args.signal,
+  });
+  return out.get(args.tokenId) ?? null;
+}
+
+/**
+ * Batched reverse-lookup: many token ids -> map of token -> {conditionId, outcomeIdx}.
+ * Pages in chunks of 100 (Goldsky's _in filter limit).
+ *
+ * Tries the live `orderbook` subgraph first, then falls back to the frozen
+ * `orderbook_resync` for any unresolved tokens.
+ */
+export async function fetchMarketsForTokens(args: {
+  tokenIds: string[];
+  signal?: AbortSignal;
+}): Promise<Map<string, { conditionId: string; outcomeIdx: number }>> {
+  const result = new Map<string, { conditionId: string; outcomeIdx: number }>();
+  const unique = Array.from(new Set(args.tokenIds.filter(Boolean)));
+  if (unique.length === 0) return result;
+
+  const CHUNK = 100;
+  const q = `query Tok($ids: [ID!]!) {
+    marketDatas(first: 1000, where: { id_in: $ids }) {
       id
-      resolutionTimestamp
-      payouts
-      positionIds
+      condition
+      outcomeIndex
     }
   }`;
-  const data = (await gqlPost(url, query, { tokenId: args.tokenId }, args.signal)) as {
-    conditions?: Array<{
-      id: string;
-      resolutionTimestamp?: string | null;
-      payouts?: string[] | null;
-      positionIds?: string[] | null;
-    }>;
-  } | null;
-  const c = data?.conditions?.[0];
-  if (!c) return null;
-  const positionIds = c.positionIds || [];
-  const idx = positionIds.findIndex((t) => String(t) === args.tokenId);
-  if (idx < 0) return null;
-  const resTs = c.resolutionTimestamp != null ? Number(c.resolutionTimestamp) : null;
-  const payouts = c.payouts ?? null;
-  let winner: number | null = null;
-  if (payouts && payouts.length >= 2) {
-    for (let i = 0; i < payouts.length; i++) {
-      const v = Number(payouts[i]);
-      if (Number.isFinite(v) && v > 0.5) {
-        winner = i;
-        break;
+
+  async function batchOn(url: string, ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    try {
+      const data = (await gqlPost(url, q, { ids }, args.signal)) as {
+        marketDatas?: Array<{
+          id: string;
+          condition?: string | null;
+          outcomeIndex?: string | null;
+        }>;
+      } | null;
+      for (const m of data?.marketDatas ?? []) {
+        if (!m.id || !m.condition) continue;
+        const idx = Number(m.outcomeIndex ?? "-1");
+        if (!Number.isFinite(idx) || idx < 0) continue;
+        result.set(String(m.id), { conditionId: m.condition, outcomeIdx: idx });
       }
+    } catch {
+      // partial failures are ok; missing tokens will be skipped downstream
     }
   }
-  return {
-    conditionId: c.id,
-    outcomeIdx: idx,
-    resolutionTimestamp: resTs && Number.isFinite(resTs) && resTs > 0 ? resTs : null,
-    payouts,
-    winnerOutcomeIdx: winner,
-  };
+
+  // Round 1: live orderbook subgraph
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    await batchOn(SUBGRAPHS.orderbook, unique.slice(i, i + CHUNK));
+  }
+  // Round 2: orderbook_resync for tokens we didn't find
+  const missing = unique.filter((t) => !result.has(t));
+  for (let i = 0; i < missing.length; i += CHUNK) {
+    await batchOn(SUBGRAPHS.orderbook_resync, missing.slice(i, i + CHUNK));
+  }
+  return result;
 }
 
 /**
