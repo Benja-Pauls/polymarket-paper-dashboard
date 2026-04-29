@@ -26,6 +26,22 @@ export type StrategyParams = {
   /** Minimum hours from trade ts -> market resolution ts. */
   min_hours_to_res: number;
   /**
+   * Maximum hours from trade ts -> market resolution ts (set to null to
+   * disable, treat unspecified as 720h = 30 days for safety).
+   *
+   * Backtest finding (favorite-longshot strategies):
+   *   <24h: mean_ret/$ -0.29 (LOSES — favorite locked in, no surprise time)
+   *   3-7d: +1.50 (BIG WIN, surprise potential intact)
+   *   30d:  break-even
+   *   >30d: drag, ties up paper-trade capital
+   *
+   * Default 720h (30 days) keeps the favorite-longshot edge intact AND ensures
+   * paper-trade positions resolve within ~1 month so we can validate strategies
+   * on realistic horizons (vs the original bug where strategies bet on 8-month
+   * resolution markets, blocking validation).
+   */
+  max_hours_to_res?: number | null;
+  /**
    * Maximum cumulative on-chain notional volume (in USDC) seen on the market
    * BEFORE this trade. Set null to disable.
    */
@@ -360,6 +376,21 @@ export function evaluateTrade(args: {
     return {
       action: "skip",
       reason: `hours_to_res=${hoursToRes.toFixed(1)} < ${params.min_hours_to_res}`,
+      entryPrice,
+      betOutcome,
+    };
+  }
+  // Default max-hold to 30 days when not specified.  Backtest finding:
+  // markets resolving > 30d out are break-even drag for favorite-longshot,
+  // and they tie up paper-trade capital so we can't validate quickly.
+  const maxHoursToRes =
+    params.max_hours_to_res === null
+      ? Number.POSITIVE_INFINITY
+      : params.max_hours_to_res ?? 720; // 30 days default
+  if (hoursToRes > maxHoursToRes) {
+    return {
+      action: "skip",
+      reason: `hours_to_res=${hoursToRes.toFixed(1)} > ${maxHoursToRes}h cap (=${(maxHoursToRes / 24).toFixed(1)}d)`,
       entryPrice,
       betOutcome,
     };
