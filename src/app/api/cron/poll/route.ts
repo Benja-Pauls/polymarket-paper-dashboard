@@ -33,13 +33,11 @@ import {
   type Strategy,
 } from "@/lib/db/schema";
 import {
-  decodeTrade,
   fetchMarketMetadata,
   fetchMarketMetadataBatch,
-  fetchMarketsForTokens,
-  fetchTradesSince,
   type DecodedTrade,
 } from "@/lib/goldsky";
+import { fetchTradesSinceFromDataApi } from "@/lib/trades";
 import {
   evaluateTrade,
   settlePosition,
@@ -64,11 +62,10 @@ type MarketCacheEntry = {
   resolutionTimestamp: number | null;
   resolved: 0 | 1;
   winnerOutcomeIdx: number | null;
-  outcomeIdx: number; // for THIS token
 };
 
-// In-process token -> market cache. Survives within one cron invocation.
-const tokenCache = new Map<string, MarketCacheEntry | null>();
+// In-process conditionId -> market cache. Survives within one cron invocation.
+const marketCache = new Map<string, MarketCacheEntry | null>();
 
 function isAuthorized(req: Request): boolean {
   if (req.headers.get("x-vercel-cron-signature")) return true;
@@ -398,50 +395,67 @@ async function runOnce(): Promise<{
   );
   const safeCursor = cursor > 0 ? cursor : NOW_S() - 5 * 60;
 
-  // Fetch new trades. Cap at 2000 / 4 pages to keep within the 300s budget.
-  const raw = await fetchTradesSince({ sinceTs: safeCursor, maxRows: 2000, maxPages: 4 });
+  // Fetch new trades from Polymarket data-api. Returns DecodedTrade[] directly
+  // (with conditionId + outcomeIdx). No token-id reverse lookup needed.
+  // This replaces Goldsky's orderbook subgraph which stalled 34h+ behind
+  // real-time on 2026-04-29 (orderFilledEvents stopped advancing while _meta
+  // block was current — Goldsky-side indexer issue).
+  const decoded = await fetchTradesSinceFromDataApi({
+    sinceTs: safeCursor,
+    maxRows: 2000,
+    maxPages: 4,
+  });
 
-  // Step 1: collect distinct token ids that need lookup
-  const tokensToLookup = new Set<string>();
-  for (const r of raw) {
-    if (r.makerAssetId === "0") tokensToLookup.add(r.takerAssetId);
-    else if (r.takerAssetId === "0") tokensToLookup.add(r.makerAssetId);
-  }
-  for (const t of tokensToLookup) if (tokenCache.has(t)) tokensToLookup.delete(t);
-
-  // Step 2: batch-fetch token -> market mappings
-  const tokenMap = await fetchMarketsForTokens({ tokenIds: Array.from(tokensToLookup) });
-
-  // Step 3: collect distinct conditionIds that need resolution metadata
-  const conditionIdsNeedingMeta = new Set<string>();
-  for (const m of tokenMap.values()) conditionIdsNeedingMeta.add(m.conditionId);
-  if (conditionIdsNeedingMeta.size > 0) {
-    const ids = Array.from(conditionIdsNeedingMeta);
+  // Step 1: collect distinct conditionIds in this batch and seed marketCache
+  // from DB.  Identify which need a metadata fetch (resolution_ts missing).
+  const distinctCids = new Set<string>(decoded.map((t) => t.conditionId));
+  const cidsNeedingMeta = new Set<string>();
+  if (distinctCids.size > 0) {
     const existing = await db
       .select({
         cid: markets.conditionId,
+        category: markets.category,
         resTs: markets.resolutionTimestamp,
+        resolved: markets.resolved,
+        winnerIdx: markets.winnerOutcomeIdx,
       })
       .from(markets)
-      .where(inArray(markets.conditionId, ids));
-    for (const { cid, resTs } of existing) {
-      if (resTs != null) conditionIdsNeedingMeta.delete(cid);
+      .where(inArray(markets.conditionId, Array.from(distinctCids)));
+    const existingByCid = new Map(existing.map((r) => [r.cid, r]));
+    for (const cid of distinctCids) {
+      const ex = existingByCid.get(cid);
+      if (ex) {
+        marketCache.set(cid, {
+          conditionId: cid,
+          category: ex.category,
+          resolutionTimestamp: ex.resTs,
+          resolved: ((ex.resolved as unknown) as 0 | 1) ?? 0,
+          winnerOutcomeIdx: ex.winnerIdx,
+        });
+        if (ex.resTs == null) cidsNeedingMeta.add(cid);
+      } else {
+        cidsNeedingMeta.add(cid);
+        marketCache.set(cid, null); // placeholder
+      }
     }
   }
 
-  // Step 4: batch-fetch resolution metadata
+  // Step 2: batch-fetch resolution metadata for newly-seen markets.
   const metaMap =
-    conditionIdsNeedingMeta.size > 0
-      ? await fetchMarketMetadataBatch({ conditionIds: Array.from(conditionIdsNeedingMeta) })
+    cidsNeedingMeta.size > 0
+      ? await fetchMarketMetadataBatch({
+          conditionIds: Array.from(cidsNeedingMeta),
+        })
       : new Map();
 
-  // Step 5: persist new market rows + populate cache
-  for (const [tokenId, mm] of tokenMap.entries()) {
-    const meta = metaMap.get(mm.conditionId);
+  // Step 3: upsert market rows for newly-seen / needing-meta markets and
+  // finalize marketCache entries.
+  for (const cid of cidsNeedingMeta) {
+    const meta = metaMap.get(cid);
     const existing = await db
       .select()
       .from(markets)
-      .where(eq(markets.conditionId, mm.conditionId))
+      .where(eq(markets.conditionId, cid))
       .limit(1);
     const exRow = existing[0];
     const category = exRow?.category ?? null;
@@ -454,7 +468,7 @@ async function runOnce(): Promise<{
       await db
         .insert(markets)
         .values({
-          conditionId: mm.conditionId,
+          conditionId: cid,
           category,
           resolutionTimestamp: resolutionTs,
           payoutsJson: payouts as string[] | null,
@@ -472,13 +486,12 @@ async function runOnce(): Promise<{
           },
         });
     }
-    tokenCache.set(tokenId, {
-      conditionId: mm.conditionId,
+    marketCache.set(cid, {
+      conditionId: cid,
       category,
       resolutionTimestamp: resolutionTs,
       resolved,
       winnerOutcomeIdx: winnerIdx,
-      outcomeIdx: mm.outcomeIdx,
     });
   }
 
@@ -497,14 +510,14 @@ async function runOnce(): Promise<{
   // Cost ceiling: at typical 15-min poll cadence we see <100 new markets per
   // run; budget is generous.
   const cidsNeedingCategory = new Set<string>();
-  for (const entry of tokenCache.values()) {
+  for (const entry of marketCache.values()) {
     if (!entry) continue;
     if (entry.category != null) continue;
     cidsNeedingCategory.add(entry.conditionId);
   }
   // Also pull in any existing markets in the DB that we touched this poll
   // and that still have category=null. (Avoids classifying the same market
-  // every poll cycle via tokenCache being process-local.)
+  // every poll cycle via marketCache being process-local.)
   if (cidsNeedingCategory.size > 0) {
     const existingNullCat = await db
       .select({ cid: markets.conditionId })
@@ -578,7 +591,7 @@ async function runOnce(): Promise<{
     }
   }
   // Persist the resolved categories + resolution timestamps. Also patch
-  // tokenCache so strategies see the category in this same invocation.
+  // marketCache so strategies see the category in this same invocation.
   for (const [cid, info] of lazyResolutions.entries()) {
     if (info.category == null && info.endTs == null) continue;
     await db
@@ -592,33 +605,16 @@ async function runOnce(): Promise<{
         updatedAt: new Date(),
       })
       .where(eq(markets.conditionId, cid));
-    for (const entry of tokenCache.values()) {
-      if (!entry) continue;
-      if (entry.conditionId !== cid) continue;
+    const entry = marketCache.get(cid);
+    if (entry) {
       if (info.category != null) entry.category = info.category;
       if (info.endTs != null && entry.resolutionTimestamp == null)
         entry.resolutionTimestamp = info.endTs;
     }
   }
 
-  // Step 6: decode trades
-  const decoded: DecodedTrade[] = [];
-  for (const r of raw) {
-    let tokenId: string | null = null;
-    if (r.makerAssetId === "0") tokenId = r.takerAssetId;
-    else if (r.takerAssetId === "0") tokenId = r.makerAssetId;
-    if (!tokenId) continue;
-    const market = tokenCache.get(tokenId);
-    if (!market) continue;
-    const t = decodeTrade(
-      r,
-      new Map([[tokenId, { conditionId: market.conditionId, outcomeIdx: market.outcomeIdx }]]),
-    );
-    if (t) decoded.push(t);
-  }
-
-  // Sort decoded chronologically (older first) — required for cap=N and for
-  // running-volume tracking to be meaningful.
+  // Step 6 (was decode-from-Goldsky): no-op now — `decoded` is already in
+  // DecodedTrade shape from the data-api fetch.  Just sort chronologically.
   decoded.sort((a, b) => a.timestamp - b.timestamp);
 
   // Step 7: build runtime state per strategy and load market metadata once
@@ -736,8 +732,8 @@ async function runOnce(): Promise<{
   let totalSettled = 0;
   let totalSettleCash = 0;
   let maxNewCursor = safeCursor;
-  for (const r of raw) {
-    const ts = Number(r.timestamp);
+  for (const t of decoded) {
+    const ts = Number(t.timestamp);
     if (Number.isFinite(ts) && ts > maxNewCursor) maxNewCursor = ts;
   }
 
@@ -798,7 +794,7 @@ async function runOnce(): Promise<{
   return {
     ok: true,
     strategies_processed: strategiesList.length,
-    trades_fetched: raw.length,
+    trades_fetched: decoded.length,
     trades_decoded: decoded.length,
     bets_placed: totalBets,
     signals_skipped: totalSkipped,
