@@ -1,5 +1,10 @@
-import "dotenv/config";
+import { config as loadEnv } from "dotenv";
 import { defineConfig } from "drizzle-kit";
+
+// Load env from .env.local first (Vercel CLI writes here), then fall back
+// to .env. Vercel-pulled `DATABASE_URL` is preferred over Postgres-prefix.
+loadEnv({ path: ".env.local" });
+loadEnv({ path: ".env" });
 
 export default defineConfig({
   schema: "./src/lib/db/schema.ts",

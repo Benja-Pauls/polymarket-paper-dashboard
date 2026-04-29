@@ -10,7 +10,7 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "seed": "tsx scripts/seed.ts",
+    "seed": "tsx --env-file=.env.local scripts/seed.ts",
     "export-seed": "python scripts/export_seed.py"
   },
   "dependencies": {

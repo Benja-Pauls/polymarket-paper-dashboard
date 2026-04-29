@@ -47,3 +47,4 @@ scripts/seed_data.json.gz
 # python venv leftovers
 __pycache__/
 *.pyc
+.env*.local
