@@ -117,6 +117,25 @@ export const positions = pgTable(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Market catalyst: an upcoming/known public event tied to a market's outcome.
+// Used by strategies that filter on `require_future_catalyst` — only bet when a
+// catalyst is in the future at trade time.
+// Source: research repo `data/features/market_catalysts_v2.parquet`.
+// ─────────────────────────────────────────────────────────────────────────────
+export const marketCatalysts = pgTable(
+  "market_catalysts",
+  {
+    conditionId: text("condition_id").primaryKey(),
+    catalystTs: bigint("catalyst_ts", { mode: "number" }).notNull(),
+    catalystSource: text("catalyst_source"),
+    catalystConfidence: text("catalyst_confidence"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [index("market_catalysts_cid_idx").on(t.conditionId)],
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Daily snapshot: per-strategy P&L for charting
 // ─────────────────────────────────────────────────────────────────────────────
 export const dailySnapshots = pgTable(
@@ -152,3 +171,5 @@ export type Position = typeof positions.$inferSelect;
 export type NewPosition = typeof positions.$inferInsert;
 export type DailySnapshot = typeof dailySnapshots.$inferSelect;
 export type NewDailySnapshot = typeof dailySnapshots.$inferInsert;
+export type MarketCatalyst = typeof marketCatalysts.$inferSelect;
+export type NewMarketCatalyst = typeof marketCatalysts.$inferInsert;

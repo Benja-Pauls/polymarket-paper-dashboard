@@ -9,7 +9,9 @@
 //       time_to_resolution ≥ min_hours_to_res  AND
 //       (max_market_volume == null OR market_running_volume_usdc < max_market_volume)
 //                                      AND
-//       count of bets on this market < cap_per_market
+//       count of bets on this market < cap_per_market  AND
+//       (skip_dow_utc not set OR dow(trade_ts UTC) NOT IN skip_dow_utc) AND
+//       (require_future_catalyst != true OR market has catalyst_ts > trade_ts)
 //
 // `baseline_v1` reproduces the original `tighter_blanket_cap10_3day` filter
 // for backward comparison.
@@ -32,6 +34,20 @@ export type StrategyParams = {
   cap_per_market: number;
   /** Slippage haircut on settlement. */
   slippage: number;
+  /**
+   * Day-of-week filter in JS UTC convention (Sunday=0, Monday=1, ..., Saturday=6).
+   * If set, trades that fall on any of these days (in UTC) are SKIPPED.
+   * Example: [3] skips Wednesday UTC.
+   * Note: Python pandas `dt.dayofweek` uses Monday=0..Sunday=6, so to translate:
+   *   js_dow = (python_dow + 1) % 7  (e.g. Python Wednesday=2 -> JS Wednesday=3)
+   */
+  skip_dow_utc?: number[];
+  /**
+   * If true, only bet when the market has a known public catalyst (in
+   * `market_catalysts`) AND that catalyst's timestamp is in the FUTURE relative
+   * to the trade timestamp. Markets with no catalyst record are skipped.
+   */
+  require_future_catalyst?: boolean;
 };
 
 export type StrategyConfig = {
@@ -137,6 +153,45 @@ export const STRATEGIES: StrategyConfig[] = [
       slippage: 0.02,
     },
   },
+  {
+    id: "geo_deep_longshot_v2_skipwed",
+    name: "GEO Deep Longshot v2 (Skip Wed)",
+    description:
+      "GEO Deep Longshot v1 + skip Wednesday UTC filter. Wednesday loses money in BOTH samples (-0.10 in-sample, -0.91 forward). In-sample mean_ret/$ +1.45 (vs v1 +1.27), forward +1.37 (vs v1 +1.25). Skip-Wed validated as 5th filter.",
+    startingBankroll: 1000,
+    stake: 10,
+    active: true,
+    params: {
+      categories: ["tradeable_geopolitical"],
+      ep_lo: 0.05,
+      ep_hi: 0.15,
+      min_hours_to_res: 24,
+      max_market_volume: 100_000,
+      cap_per_market: 20,
+      // Wednesday in JS UTC convention (Sunday=0). Equivalent to Python dt.dayofweek==2.
+      skip_dow_utc: [3],
+      slippage: 0.02,
+    },
+  },
+  {
+    id: "geo_deep_longshot_v3_catalyst",
+    name: "GEO Deep Longshot v3 (Catalyst Future)",
+    description:
+      "GEO Deep Longshot v1 + only bet when a public catalyst is in the future. Catalyst-future filter VALIDATED forward-OOS: in-sample +3.93 mean_ret/$, forward +1.78. Smaller universe (more concentrated) but higher per-bet edge.",
+    startingBankroll: 1000,
+    stake: 10,
+    active: true,
+    params: {
+      categories: ["tradeable_geopolitical"],
+      ep_lo: 0.05,
+      ep_hi: 0.15,
+      min_hours_to_res: 24,
+      max_market_volume: 100_000,
+      cap_per_market: 20,
+      require_future_catalyst: true,
+      slippage: 0.02,
+    },
+  },
 ];
 
 /**
@@ -185,6 +240,13 @@ export function evaluateTrade(args: {
    */
   marketRunningVolumeUsdc: number | null;
   marketBetCount: number;
+  /**
+   * Public-catalyst timestamp (unix seconds) for this market, if known. Used by
+   * strategies with `require_future_catalyst: true`. Pass null/undefined when
+   * no catalyst is recorded; the filter then SKIPS this trade for catalyst-
+   * gated strategies.
+   */
+  marketCatalystTs?: number | null;
   cash: number;
   stake: number;
   params: StrategyParams;
@@ -195,6 +257,7 @@ export function evaluateTrade(args: {
     marketCategory,
     marketRunningVolumeUsdc,
     marketBetCount,
+    marketCatalystTs,
     cash,
     stake,
     params,
@@ -274,6 +337,36 @@ export function evaluateTrade(args: {
       entryPrice,
       betOutcome,
     };
+  }
+  if (params.skip_dow_utc && params.skip_dow_utc.length > 0) {
+    // JS Date.getUTCDay(): Sunday=0, Monday=1, ..., Saturday=6.
+    const dow = new Date(trade.timestamp * 1000).getUTCDay();
+    if (params.skip_dow_utc.includes(dow)) {
+      return {
+        action: "skip",
+        reason: `skip_dow_utc filter (dow=${dow})`,
+        entryPrice,
+        betOutcome,
+      };
+    }
+  }
+  if (params.require_future_catalyst === true) {
+    if (marketCatalystTs == null) {
+      return {
+        action: "skip",
+        reason: "no future catalyst (no catalyst record)",
+        entryPrice,
+        betOutcome,
+      };
+    }
+    if (marketCatalystTs <= trade.timestamp) {
+      return {
+        action: "skip",
+        reason: `no future catalyst (catalyst_ts=${marketCatalystTs} <= trade_ts=${trade.timestamp})`,
+        entryPrice,
+        betOutcome,
+      };
+    }
   }
   if (cash < stake) {
     return {

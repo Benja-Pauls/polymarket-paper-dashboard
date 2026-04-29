@@ -5,16 +5,23 @@
 //    keeping its historical signals/positions for record.
 // 3. Loads watched markets from scripts/seed_data.json (produced by
 //    `scripts/export_seed.py`) and upserts them into the markets table.
+// 4. Loads market catalysts from scripts/catalyst_data.json (produced by
+//    `scripts/export_catalysts.py`) and upserts them into the
+//    `market_catalysts` table. Used by `require_future_catalyst` strategies.
 //
 // Usage:   pnpm seed
 // Idempotent — safe to re-run.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { inArray, sql } from "drizzle-orm";
 
 import { db } from "../src/lib/db";
-import { strategies, markets } from "../src/lib/db/schema";
+import {
+  strategies,
+  markets,
+  marketCatalysts,
+} from "../src/lib/db/schema";
 import { STRATEGIES, RETIRED_STRATEGY_IDS } from "../src/lib/strategy";
 
 type SeedRow = {
@@ -33,6 +40,19 @@ type SeedFile = {
   n_markets: number;
   n_with_token_map: number;
   watched_markets: SeedRow[];
+};
+
+type CatalystRow = {
+  condition_id: string;
+  catalyst_ts: number;
+  catalyst_source: string | null;
+  catalyst_confidence: string | null;
+};
+
+type CatalystFile = {
+  generated_at: string;
+  n_catalysts: number;
+  catalysts: CatalystRow[];
 };
 
 async function main() {
@@ -137,7 +157,64 @@ async function main() {
     }
   }
 
-  console.log(`[seed] done. ${total} markets in DB. ${STRATEGIES.length} strategies seeded.`);
+  // 4. Load catalysts from scripts/catalyst_data.json (optional).
+  const catalystPath = join(process.cwd(), "scripts", "catalyst_data.json");
+  let nCatalysts = 0;
+  if (existsSync(catalystPath)) {
+    let cat: CatalystFile;
+    try {
+      cat = JSON.parse(readFileSync(catalystPath, "utf8")) as CatalystFile;
+    } catch (e) {
+      console.error(
+        `[seed] could not parse ${catalystPath}; skipping catalyst load.`,
+        e,
+      );
+      cat = { generated_at: "", n_catalysts: 0, catalysts: [] };
+    }
+    console.log(
+      `[seed] loaded ${cat.catalysts.length.toLocaleString()} catalyst rows from ${catalystPath} (generated_at ${cat.generated_at})`,
+    );
+
+    // Bulk upsert in batches.
+    let catTotal = 0;
+    for (let i = 0; i < cat.catalysts.length; i += BATCH) {
+      const slice = cat.catalysts.slice(i, i + BATCH);
+      await db
+        .insert(marketCatalysts)
+        .values(
+          slice.map((r) => ({
+            conditionId: r.condition_id,
+            catalystTs: r.catalyst_ts,
+            catalystSource: r.catalyst_source ?? null,
+            catalystConfidence: r.catalyst_confidence ?? null,
+          })),
+        )
+        .onConflictDoUpdate({
+          target: marketCatalysts.conditionId,
+          set: {
+            catalystTs: sql`excluded.catalyst_ts`,
+            catalystSource: sql`excluded.catalyst_source`,
+            catalystConfidence: sql`excluded.catalyst_confidence`,
+            updatedAt: new Date(),
+          },
+        });
+      catTotal += slice.length;
+      if (i % 5000 === 0 || catTotal === cat.catalysts.length) {
+        console.log(
+          `[seed]   upserted ${catTotal.toLocaleString()} / ${cat.catalysts.length.toLocaleString()} catalysts`,
+        );
+      }
+    }
+    nCatalysts = catTotal;
+  } else {
+    console.log(
+      `[seed] no catalyst_data.json at ${catalystPath} — skipping catalyst load. Run \`python scripts/export_catalysts.py\` to populate.`,
+    );
+  }
+
+  console.log(
+    `[seed] done. ${total} markets, ${nCatalysts} catalysts in DB. ${STRATEGIES.length} strategies seeded.`,
+  );
 }
 
 main().catch((e) => {

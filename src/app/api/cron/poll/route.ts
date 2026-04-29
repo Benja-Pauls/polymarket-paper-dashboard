@@ -25,6 +25,7 @@ import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   dailySnapshots,
+  marketCatalysts,
   markets,
   positions as positionsTable,
   signals as signalsTable,
@@ -253,8 +254,16 @@ async function processStrategyTrade(args: {
   marketResolutionTs: number | null;
   marketCategory: string | null;
   marketRunningVolumeUsdc: number;
+  marketCatalystTs: number | null;
 }): Promise<void> {
-  const { state, trade, marketResolutionTs, marketCategory, marketRunningVolumeUsdc } = args;
+  const {
+    state,
+    trade,
+    marketResolutionTs,
+    marketCategory,
+    marketRunningVolumeUsdc,
+    marketCatalystTs,
+  } = args;
 
   if (trade.timestamp <= (state.strategy.lastPollTs ?? 0)) {
     // Already past our cursor — defensive
@@ -275,6 +284,7 @@ async function processStrategyTrade(args: {
     marketCategory,
     marketRunningVolumeUsdc,
     marketBetCount: await getBetCount(state, trade.conditionId),
+    marketCatalystTs,
     cash: state.cash,
     stake: state.strategy.stake,
     params: state.params,
@@ -509,6 +519,26 @@ async function runOnce(): Promise<{
     }
   }
 
+  // Pre-load catalyst timestamps for all unique conditionIds. Only loaded if
+  // any active strategy actually uses `require_future_catalyst` (avoids a
+  // useless query when no one needs it).
+  const anyStrategyNeedsCatalyst = states.some(
+    (s) => s.params.require_future_catalyst === true,
+  );
+  const catalystCache = new Map<string, number>();
+  if (anyStrategyNeedsCatalyst && uniqueCids.length > 0) {
+    const catRows = await db
+      .select({
+        cid: marketCatalysts.conditionId,
+        ts: marketCatalysts.catalystTs,
+      })
+      .from(marketCatalysts)
+      .where(inArray(marketCatalysts.conditionId, uniqueCids));
+    for (const { cid, ts } of catRows) {
+      if (ts != null) catalystCache.set(cid, Number(ts));
+    }
+  }
+
   // Step 8: walk trades chronologically.
   // For each trade: every strategy evaluates against the PRE-trade running
   // volume. Then we bump the running volume by the trade's notional.
@@ -517,6 +547,7 @@ async function runOnce(): Promise<{
     const runningVolBefore = meta?.runningVolumeUsdc ?? 0;
     const category = meta?.resolved ? null : meta?.category ?? null;
     const resolutionTs = meta?.resolutionTs ?? null;
+    const catalystTs = catalystCache.get(trade.conditionId) ?? null;
 
     for (const state of states) {
       await processStrategyTrade({
@@ -525,6 +556,7 @@ async function runOnce(): Promise<{
         marketResolutionTs: resolutionTs,
         marketCategory: category,
         marketRunningVolumeUsdc: runningVolBefore,
+        marketCatalystTs: catalystTs,
       });
     }
 
