@@ -15,7 +15,7 @@
 // NO real-money execution. Paper-money only.
 
 import { NextResponse } from "next/server";
-import { and, desc, eq, isNull, lt, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lt, sql } from "drizzle-orm";
 
 import { db } from "@/lib/db";
 import {
@@ -396,15 +396,17 @@ async function runOnce(): Promise<{
   // Step 3: collect distinct conditionIds that need resolution metadata
   const conditionIdsNeedingMeta = new Set<string>();
   for (const m of tokenMap.values()) conditionIdsNeedingMeta.add(m.conditionId);
-  // Drop conditionIds already known in DB with resolution_ts populated
+  // Drop conditionIds already known in DB with resolution_ts populated.
+  // Use inArray which handles parameter-typing correctly.
   if (conditionIdsNeedingMeta.size > 0) {
+    const ids = Array.from(conditionIdsNeedingMeta);
     const existing = await db
       .select({
         cid: markets.conditionId,
         resTs: markets.resolutionTimestamp,
       })
       .from(markets)
-      .where(sql`${markets.conditionId} = ANY(${Array.from(conditionIdsNeedingMeta)})`);
+      .where(inArray(markets.conditionId, ids));
     for (const { cid, resTs } of existing) {
       if (resTs != null) conditionIdsNeedingMeta.delete(cid);
     }
