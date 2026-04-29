@@ -262,6 +262,7 @@ async function processStrategyTrade(args: {
   marketRunningVolumeUsdc: number;
   marketCatalystTs: number | null;
   marketCatalystSource: string | null;
+  marketQuestionText: string | null;
 }): Promise<void> {
   const {
     state,
@@ -271,6 +272,7 @@ async function processStrategyTrade(args: {
     marketRunningVolumeUsdc,
     marketCatalystTs,
     marketCatalystSource,
+    marketQuestionText,
   } = args;
 
   if (trade.timestamp <= (state.strategy.lastPollTs ?? 0)) {
@@ -294,6 +296,7 @@ async function processStrategyTrade(args: {
     marketBetCount: await getBetCount(state, trade.conditionId),
     marketCatalystTs,
     marketCatalystSource,
+    marketQuestionText,
     cash: state.cash,
     stake: state.strategy.stake,
     params: state.params,
@@ -630,6 +633,7 @@ async function runOnce(): Promise<{
       resolutionTs: number | null;
       resolved: number;
       runningVolumeUsdc: number;
+      questionText: string | null;
     }
   >();
   if (uniqueCids.length > 0) {
@@ -643,6 +647,7 @@ async function runOnce(): Promise<{
         resolutionTs: m.resolutionTimestamp ?? null,
         resolved: m.resolved ?? 0,
         runningVolumeUsdc: Number(m.runningVolumeUsdc ?? 0),
+        questionText: m.questionText ?? null,
       });
     }
   }
@@ -680,6 +685,7 @@ async function runOnce(): Promise<{
     const runningVolBefore = meta?.runningVolumeUsdc ?? 0;
     const category = meta?.resolved ? null : meta?.category ?? null;
     const resolutionTs = meta?.resolutionTs ?? null;
+    const questionText = meta?.questionText ?? null;
     const catalystEntry = catalystCache.get(trade.conditionId);
     const catalystTs = catalystEntry?.ts ?? null;
     const catalystSource = catalystEntry?.source ?? null;
@@ -693,6 +699,7 @@ async function runOnce(): Promise<{
         marketRunningVolumeUsdc: runningVolBefore,
         marketCatalystTs: catalystTs,
         marketCatalystSource: catalystSource,
+        marketQuestionText: questionText,
       });
     }
 
@@ -705,6 +712,7 @@ async function runOnce(): Promise<{
         resolutionTs: null,
         resolved: 0,
         runningVolumeUsdc: newVol,
+        questionText: null,
       });
   }
 

@@ -80,7 +80,82 @@ export type StrategyParams = {
    * combination with `require_future_catalyst: true`.
    */
   require_real_catalyst_source?: boolean;
+  /**
+   * Optional list of question-pattern category names to EXCLUDE. Each name
+   * maps to a regex defined in `QUESTION_EXCLUSION_PATTERNS` below. If the
+   * market's `question_text` matches any of the listed patterns, the trade
+   * is skipped.
+   *
+   * Wave 8 finding: favorite-longshot bias only works in markets where
+   * outcomes can SURPRISE. Markets anchored by structural inertia (regime
+   * change, elections, judicial rulings, scheduled announcements, etc.)
+   * resolve to the status-quo favorite — they don't surprise. Excluding
+   * these patterns lifts both per-bet edge AND market diversification.
+   *
+   * Available pattern names (see QUESTION_EXCLUSION_PATTERNS for regexes):
+   *   - regime_change
+   *   - tech_test
+   *   - legislative
+   *   - judicial
+   *   - announcement
+   *   - diplomatic
+   *   - election
+   *   - price_threshold
+   */
+  exclude_question_patterns?: string[];
 };
+
+/**
+ * Regex patterns for question-text exclusion. Sourced from the wave 8
+ * `wave8_question_patterns_v4.py` Python classifier; ported to JS regex
+ * (with `\b` word boundaries) and made case-insensitive via the `i` flag.
+ *
+ * IMPORTANT: keep these in sync with the Python `classify_pattern` function
+ * — a market is "in" a pattern if its lowercased question matches the regex.
+ * The Python classifier uses an if/elif chain so a question only ever lands
+ * in one bucket, but the dashboard's exclusion filter treats them as a
+ * union: ANY match excludes the trade.
+ */
+export const QUESTION_EXCLUSION_PATTERNS: Record<string, RegExp> = {
+  regime_change:
+    /\b(coup|regime|overthr|topple|resign|impeach|step down)/i,
+  tech_test:
+    /\b(launch|tested|test fire|test launch|develop|rocket|satellite)/i,
+  legislative:
+    /\b(approve|reject|pass|veto|signed|ratif|confirm)/i,
+  judicial:
+    /\b(arrest|indict|guilty|verdict|trial|convict)/i,
+  announcement:
+    /\b(announc|tweet|comment|claim|state|report|public statement)/i,
+  diplomatic:
+    /\b(meet|visit|talks|treaty|deal|ceasefire|negotiat|summit|peace|accord)/i,
+  election:
+    /\b(elected|election|presiden|prime minister|wins\s+race|lose\s+race|primary)/i,
+  price_threshold:
+    /\b(price|hit|reach|exceed|cross|bitcoin|ethereum|btc|eth|stock|all.time|index)/i,
+};
+
+/**
+ * Returns the FIRST excluded pattern name whose regex matches the question
+ * text, or null if no exclusion pattern matches. Unknown pattern names in
+ * `excludePatterns` are silently skipped (no-op).
+ */
+export function findExcludedPattern(args: {
+  questionText: string | null | undefined;
+  excludePatterns: string[];
+}): string | null {
+  const { questionText, excludePatterns } = args;
+  if (!questionText || excludePatterns.length === 0) return null;
+  // The Python classifier lowercases before testing, so do the same here for
+  // robust matching even though the regexes already have the `i` flag.
+  const q = questionText.toLowerCase();
+  for (const name of excludePatterns) {
+    const re = QUESTION_EXCLUSION_PATTERNS[name];
+    if (!re) continue;
+    if (re.test(q)) return name;
+  }
+  return null;
+}
 
 export type StrategyConfig = {
   id: string;
@@ -247,6 +322,40 @@ export const STRATEGIES: StrategyConfig[] = [
       slippage: 0.02,
     },
   },
+  {
+    id: "v4_broad_clean_v1",
+    name: "Broad Clean (v4-broad-clean)",
+    description:
+      "All-tradeable-categories favorite-longshot with 8 semantic exclusions. Deep-longshot doesn't work in markets anchored by structural inertia (regime change, election, legislative, judicial, etc.). Exclude those 8 question patterns. Highest bootstrap P5 of any variant ($19.8K forward) and best diversification (89 markets vs GEO v4's 16). Bar-1 floor strategy, complementary to GEO Deep Longshot.",
+    startingBankroll: 1000,
+    stake: 10,
+    active: true,
+    params: {
+      categories: [
+        "tradeable_geopolitical",
+        "tradeable_political",
+        "tradeable_corporate",
+        "tradeable_crypto",
+      ],
+      ep_lo: 0.05,
+      ep_hi: 0.15,
+      min_hours_to_res: 72,
+      max_hours_to_res: 720, // 30d default
+      max_market_volume: null, // no volume cap for this variant
+      cap_per_market: 10,
+      slippage: 0.02,
+      exclude_question_patterns: [
+        "regime_change",
+        "tech_test",
+        "legislative",
+        "judicial",
+        "announcement",
+        "diplomatic",
+        "election",
+        "price_threshold",
+      ],
+    },
+  },
 ];
 
 /**
@@ -308,6 +417,14 @@ export function evaluateTrade(args: {
    * `require_real_catalyst_source: true`.
    */
   marketCatalystSource?: string | null;
+  /**
+   * Market question text, if known. Used by strategies with
+   * `exclude_question_patterns`. When the strategy specifies that filter
+   * AND the question text is null/missing, the trade is allowed through
+   * (no signal to filter on). When non-null, it's tested against each
+   * named regex in `QUESTION_EXCLUSION_PATTERNS`.
+   */
+  marketQuestionText?: string | null;
   cash: number;
   stake: number;
   params: StrategyParams;
@@ -320,6 +437,7 @@ export function evaluateTrade(args: {
     marketBetCount,
     marketCatalystTs,
     marketCatalystSource,
+    marketQuestionText,
     cash,
     stake,
     params,
@@ -475,6 +593,29 @@ export function evaluateTrade(args: {
           betOutcome,
         };
       }
+    }
+  }
+  // Optional question-pattern exclusion filter (wave 8 finding).
+  // Skip the trade if the market's question_text matches any of the named
+  // patterns. If question_text is missing, the trade is allowed through —
+  // we don't have a signal to filter on, and we don't want to silently
+  // reject the entire universe just because a question lookup is stale.
+  if (
+    params.exclude_question_patterns &&
+    params.exclude_question_patterns.length > 0 &&
+    marketQuestionText
+  ) {
+    const matched = findExcludedPattern({
+      questionText: marketQuestionText,
+      excludePatterns: params.exclude_question_patterns,
+    });
+    if (matched != null) {
+      return {
+        action: "skip",
+        reason: `question matches excluded pattern: ${matched}`,
+        entryPrice,
+        betOutcome,
+      };
     }
   }
   if (cash < stake) {
