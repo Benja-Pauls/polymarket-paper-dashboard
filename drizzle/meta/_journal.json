@@ -22,6 +22,13 @@
       "when": 1777487754019,
       "tag": "0002_broken_sunspot",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1777488561785,
+      "tag": "0003_cultured_young_avengers",
+      "breakpoints": true
     }
   ]
 }

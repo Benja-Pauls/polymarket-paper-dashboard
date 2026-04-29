@@ -159,6 +159,47 @@ export const dailySnapshots = pgTable(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Strategy methodology: the "why" behind each strategy. One row per strategy.
+// Read-only documentation surface, populated by `scripts/seed_methodology.ts`.
+// Renders on the strategy detail page under the Methodology tab so the
+// dashboard doubles as a reference doc that's queryable separately from
+// chat conversations.
+// ─────────────────────────────────────────────────────────────────────────────
+export type FilterDescription = {
+  name: string;
+  description: string;
+  validation: string;
+};
+
+export type MethodologyMetrics = {
+  mean_ret_per_dollar?: number;
+  total_pnl?: number;
+  p5?: number;
+  p_pos?: number;
+  top1_pct?: number;
+  n_bets?: number;
+  n_markets?: number;
+  // Free-form annotation, e.g. "21mo (Aug 2024 – Apr 2026)".
+  span_label?: string;
+};
+
+export const strategyMethodology = pgTable("strategy_methodology", {
+  strategyId: text("strategy_id")
+    .primaryKey()
+    .references(() => strategies.id, { onDelete: "cascade" }),
+  hypothesis: text("hypothesis").notNull(),
+  inSampleMetrics: jsonb("in_sample_metrics").$type<MethodologyMetrics>(),
+  forwardMetrics: jsonb("forward_metrics").$type<MethodologyMetrics>(),
+  perYearMetrics: jsonb("per_year_metrics").$type<Record<string, MethodologyMetrics>>(),
+  filterDescriptions: jsonb("filter_descriptions").$type<FilterDescription[]>(),
+  knownIssues: text("known_issues"),
+  // 'Bar 2 alpha' | 'Bar 1 floor' | 'borderline' | 'comparison'
+  barStatus: text("bar_status").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Type exports
 // ─────────────────────────────────────────────────────────────────────────────
 export type Strategy = typeof strategies.$inferSelect;
@@ -173,3 +214,5 @@ export type DailySnapshot = typeof dailySnapshots.$inferSelect;
 export type NewDailySnapshot = typeof dailySnapshots.$inferInsert;
 export type MarketCatalyst = typeof marketCatalysts.$inferSelect;
 export type NewMarketCatalyst = typeof marketCatalysts.$inferInsert;
+export type StrategyMethodology = typeof strategyMethodology.$inferSelect;
+export type NewStrategyMethodology = typeof strategyMethodology.$inferInsert;

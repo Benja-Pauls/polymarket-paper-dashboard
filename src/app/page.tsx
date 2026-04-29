@@ -1,10 +1,15 @@
 import Link from "next/link";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { listStrategies, getStrategySummary } from "@/lib/queries";
+import {
+  listStrategies,
+  getStrategySummary,
+  listStrategyBarStatuses,
+} from "@/lib/queries";
 import type { Strategy } from "@/lib/db/schema";
 import { fmtUsd, fmtPct, fmtUsdSigned } from "@/lib/format";
 import { Sparkline } from "@/components/sparkline";
+import { BarStatusBadge } from "@/components/methodology-tab";
 import { Separator } from "@/components/ui/separator";
 
 export const dynamic = "force-dynamic";
@@ -19,15 +24,18 @@ export default async function HomePage() {
     dbError = (e as Error).message;
   }
 
-  const summaries = await Promise.all(
-    strategies.map(async (s) => {
-      try {
-        return await getStrategySummary(s);
-      } catch {
-        return null;
-      }
-    }),
-  );
+  const [summaries, barStatuses] = await Promise.all([
+    Promise.all(
+      strategies.map(async (s) => {
+        try {
+          return await getStrategySummary(s);
+        } catch {
+          return null;
+        }
+      }),
+    ),
+    listStrategyBarStatuses().catch(() => ({}) as Record<string, string>),
+  ]);
 
   return (
     <div className="space-y-8">
@@ -77,12 +85,17 @@ export default async function HomePage() {
                           {sum.strategy.description ?? ""}
                         </CardDescription>
                       </div>
-                      <Badge
-                        variant={status === "active" ? "default" : status === "halted" ? "destructive" : "secondary"}
-                        className="capitalize"
-                      >
-                        {status}
-                      </Badge>
+                      <div className="flex flex-col items-end gap-1.5">
+                        <Badge
+                          variant={status === "active" ? "default" : status === "halted" ? "destructive" : "secondary"}
+                          className="capitalize"
+                        >
+                          {status}
+                        </Badge>
+                        {barStatuses[sum.strategy.id] && (
+                          <BarStatusBadge status={barStatuses[sum.strategy.id]} />
+                        )}
+                      </div>
                     </div>
                   </CardHeader>
                   <CardContent className="space-y-4">

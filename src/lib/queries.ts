@@ -9,11 +9,13 @@ import {
   positions as positionsTable,
   signals as signalsTable,
   strategies,
+  strategyMethodology,
   type DailySnapshot,
   type Market,
   type Position,
   type Signal,
   type Strategy,
+  type StrategyMethodology,
 } from "./db/schema";
 import { computeTripwireStatus, type TripwireStatus } from "./strategy";
 
@@ -298,4 +300,32 @@ export async function getMarketDetail(
       category: market?.category ?? null,
     })),
   };
+}
+
+/** Returns the methodology row for a strategy (or null if none seeded). */
+export async function getStrategyMethodology(
+  strategyId: string,
+): Promise<StrategyMethodology | null> {
+  const r = await db
+    .select()
+    .from(strategyMethodology)
+    .where(eq(strategyMethodology.strategyId, strategyId))
+    .limit(1);
+  return r[0] ?? null;
+}
+
+/**
+ * Returns a map { strategyId -> barStatus } so the leaderboard can render a
+ * Bar-status badge on each card without hitting the DB once per strategy.
+ */
+export async function listStrategyBarStatuses(): Promise<Record<string, string>> {
+  const rows = await db
+    .select({
+      strategyId: strategyMethodology.strategyId,
+      barStatus: strategyMethodology.barStatus,
+    })
+    .from(strategyMethodology);
+  const out: Record<string, string> = {};
+  for (const r of rows) out[r.strategyId] = r.barStatus;
+  return out;
 }

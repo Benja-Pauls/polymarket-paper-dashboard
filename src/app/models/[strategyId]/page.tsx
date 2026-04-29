@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
+import { BarStatusBadge, MethodologyTab } from "@/components/methodology-tab";
 import { TripwirePanel } from "@/components/tripwire-panel";
 import { WealthCurve } from "@/components/wealth-curve";
 import {
@@ -29,6 +30,7 @@ import {
   getOpenPositions,
   getRecentSignals,
   getStrategy,
+  getStrategyMethodology,
   getStrategySummary,
   getStrategyTripwires,
   getWealthCurve,
@@ -46,14 +48,16 @@ export default async function StrategyDetailPage({
   const strategy = await getStrategy(strategyId);
   if (!strategy) notFound();
 
-  const [summary, wealth, openPos, closedPos, recentSignals, tripwires] = await Promise.all([
-    getStrategySummary(strategy),
-    getWealthCurve(strategy.id),
-    getOpenPositions(strategy.id, 200),
-    getClosedPositions(strategy.id, 200),
-    getRecentSignals(strategy.id, 50),
-    getStrategyTripwires(strategy),
-  ]);
+  const [summary, wealth, openPos, closedPos, recentSignals, tripwires, methodology] =
+    await Promise.all([
+      getStrategySummary(strategy),
+      getWealthCurve(strategy.id),
+      getOpenPositions(strategy.id, 200),
+      getClosedPositions(strategy.id, 200),
+      getRecentSignals(strategy.id, 50),
+      getStrategyTripwires(strategy),
+      getStrategyMethodology(strategy.id),
+    ]);
 
   const params_ = (strategy.paramsJson as Record<string, unknown>) ?? {};
 
@@ -74,12 +78,15 @@ export default async function StrategyDetailPage({
               {Number(strategy.startingBankroll).toFixed(0)}
             </p>
           </div>
-          <Badge
-            variant={strategy.status === "active" ? "default" : "secondary"}
-            className="capitalize"
-          >
-            {strategy.status}
-          </Badge>
+          <div className="flex items-center gap-2">
+            {methodology && <BarStatusBadge status={methodology.barStatus} />}
+            <Badge
+              variant={strategy.status === "active" ? "default" : "secondary"}
+              className="capitalize"
+            >
+              {strategy.status}
+            </Badge>
+          </div>
         </div>
       </header>
 
@@ -118,6 +125,7 @@ export default async function StrategyDetailPage({
           <TabsTrigger value="open">Open positions ({openPos.length})</TabsTrigger>
           <TabsTrigger value="signals">Recent signals ({recentSignals.length})</TabsTrigger>
           <TabsTrigger value="closed">Closed positions ({closedPos.length})</TabsTrigger>
+          <TabsTrigger value="methodology">Methodology</TabsTrigger>
           <TabsTrigger value="params">Params</TabsTrigger>
           <TabsTrigger value="tripwires">Tripwires</TabsTrigger>
         </TabsList>
@@ -292,6 +300,22 @@ export default async function StrategyDetailPage({
               )}
             </CardContent>
           </Card>
+        </TabsContent>
+
+        <TabsContent value="methodology" className="mt-4">
+          {methodology ? (
+            <MethodologyTab m={methodology} />
+          ) : (
+            <Card className="border-border/60">
+              <CardHeader>
+                <CardTitle className="text-base">No methodology recorded</CardTitle>
+                <CardDescription>
+                  Run <code className="font-mono">pnpm exec tsx --env-file=.env.local scripts/seed_methodology.ts</code> to
+                  populate the methodology entry for this strategy.
+                </CardDescription>
+              </CardHeader>
+            </Card>
+          )}
         </TabsContent>
 
         <TabsContent value="params" className="mt-4">
