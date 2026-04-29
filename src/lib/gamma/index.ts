@@ -38,30 +38,68 @@ export async function fetchOpenMarkets(args: {
   maxRows?: number;
   /** Skip markets with endDate already in the past (sometimes Gamma returns stale). */
   futureOnly?: boolean;
+  /**
+   * Skip markets with endDate FURTHER OUT than this many days from now.
+   * Default 60 days. Strategy max_hours_to_res defaults to 720h (30d), so 60d
+   * gives a buffer for markets where time-to-resolution shrinks as we
+   * accumulate trades closer to resolution. Setting null disables the cap.
+   *
+   * This avoids spending Anthropic API calls (Claude Haiku ~$0.0001/call)
+   * classifying markets we can't bet on anyway, and keeps the watched market
+   * universe focused on near-resolution markets where favorite-longshot edge
+   * lives.
+   */
+  maxEndDateDays?: number | null;
   signal?: AbortSignal;
 }): Promise<GammaMarket[]> {
-  const { maxRows = 5000, futureOnly = true, signal } = args;
+  const {
+    maxRows = 5000,
+    futureOnly = true,
+    maxEndDateDays = 60,
+    signal,
+  } = args;
   const LIMIT = 500;
   let offset = 0;
   const out: GammaMarket[] = [];
   const nowS = Math.floor(Date.now() / 1000);
+  const farFutureCap =
+    maxEndDateDays == null ? null : nowS + maxEndDateDays * 86400;
+
+  let totalSeen = 0;
+  let droppedFarFuture = 0;
+  let droppedPast = 0;
 
   while (out.length < maxRows) {
     const url = `${BASE}/markets?active=true&closed=false&limit=${LIMIT}&offset=${offset}`;
     const data = await fetchPage(url, signal);
     if (!Array.isArray(data) || data.length === 0) break;
     for (const r of data) {
+      totalSeen++;
       const m = normalize(r);
       if (!m) continue;
-      if (futureOnly && m.endDate) {
+      if (m.endDate) {
         const ts = parseEndTs(m.endDate);
-        if (ts != null && ts <= nowS) continue;
+        if (ts != null) {
+          if (futureOnly && ts <= nowS) {
+            droppedPast++;
+            continue;
+          }
+          if (farFutureCap != null && ts > farFutureCap) {
+            droppedFarFuture++;
+            continue;
+          }
+        }
       }
       out.push(m);
       if (out.length >= maxRows) break;
     }
     offset += data.length;
     if (data.length < LIMIT) break;
+  }
+  if (droppedFarFuture > 0 || droppedPast > 0) {
+    console.log(
+      `[gamma.fetchOpenMarkets] kept=${out.length} of ${totalSeen}; dropped past=${droppedPast} far-future=${droppedFarFuture} (cap=${maxEndDateDays}d)`,
+    );
   }
   return out;
 }
