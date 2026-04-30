@@ -25,8 +25,12 @@ export const config: VercelConfig = {
       // has `resolution_timestamp = NULL` and every strategy skips with
       // "no resolution timestamp known".
       path: "/api/cron/sync-open-markets",
-      // Every 6 hours. Open-markets list doesn't change fast.
-      schedule: "0 */6 * * *",
+      // Every 1 hour. Each run processes up to 25K markets (Gamma has ~50K
+      // open). The 1500 LLM-call cap means we backfill new markets across
+      // multiple runs — hourly cadence keeps the LLM-needed backlog draining
+      // and gives us ~24 chances/day to catch newly-resolved-far-future
+      // markets that drifted into our DB via lazy-classify.
+      schedule: "0 * * * *",
     },
   ],
 };
