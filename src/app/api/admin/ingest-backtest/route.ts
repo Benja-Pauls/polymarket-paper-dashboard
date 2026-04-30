@@ -134,7 +134,12 @@ function parseWalkforward(json: Record<string, unknown>): {
   const cfg = (json.config as Record<string, unknown>) ?? {};
   const bankroll = num(cfg.bankroll) ?? 5000;
   const stake = num(cfg.stake) ?? 50;
+  // The walk-forward JSON uses `verdicts.<strategy_id>` as the per-strategy
+  // payload (with `pct_positive`, `worst_monthly_pnl`, `cum_pnl_combined`,
+  // `oos_overall_total_pnl`, etc.). Fall back to `summary` / `strategies` for
+  // future-format flexibility.
   const summary =
+    (json.verdicts as Record<string, unknown>) ??
     (json.summary as Record<string, unknown>) ??
     (json.per_strategy as Record<string, unknown>) ??
     (json.strategies as Record<string, unknown>) ??
@@ -142,30 +147,52 @@ function parseWalkforward(json: Record<string, unknown>): {
   const out: Record<string, NewBacktestRun> = {};
   for (const [sid, raw] of Object.entries(summary)) {
     const r = (raw as Record<string, unknown>) ?? {};
-    // Look for both walk-forward + forward-OOS aggregates.
-    const oos = ((r.forward_oos as Record<string, unknown>) ?? {}) as Record<string, unknown>;
     out[sid] = {
       runLabel: "",
       strategyId: sid,
-      dataSpanStart: (cfg.walkforward_span_start as string) ?? null,
-      dataSpanEnd: (cfg.forward_oos_span_end as string) ?? null,
-      nBets: num(oos.n_bets) ?? num(r.total_bets),
-      nMarkets: num(oos.n_markets) ?? num(r.total_markets),
+      dataSpanStart:
+        (cfg.walkforward_span_start as string) ??
+        (cfg.train_span_start as string) ??
+        null,
+      dataSpanEnd:
+        (cfg.forward_oos_span_end as string) ??
+        (cfg.test_span_end as string) ??
+        null,
+      // No raw bet count exposed in verdicts; fall back to monthly_series len.
+      nBets: null,
+      nMarkets: null,
       bankroll,
       stake,
-      meanRetPerDollar: num(oos.mean_ret_per_dollar) ?? num(r.aggregate_mean_ret),
-      totalPnl: num(oos.total) ?? num(r.aggregate_total_pnl),
-      p5: num(oos.p5) ?? num(r.aggregate_p5),
-      p50: num(oos.p50) ?? num(r.aggregate_p50),
-      p95: num(oos.p95) ?? num(r.aggregate_p95),
-      pPos: num(r.pct_positive_months),
-      top1Conc: num(oos.top1_conc),
-      betsPerMonth: num(r.bets_per_month),
+      // Walk-forward doesn't report mean_ret_per_dollar at the aggregate level;
+      // the verdict lives in pct_positive (monthly P_pos) + cum P&L.
+      meanRetPerDollar: null,
+      // Use combined cumulative P&L (walk-forward + forward-OOS) as the
+      // headline total — most informative for the trend display.
+      totalPnl: num(r.cum_pnl_combined) ?? num(r.oos_overall_total_pnl),
+      // No bootstrap CI on monthly granularity; surface worst-month as a
+      // proxy for downside risk in the headline view.
+      p5: num(r.worst_monthly_pnl),
+      p50: null,
+      p95: num(r.best_monthly_pnl),
+      // pct_positive is "% of monthly cohorts positive" — a different
+      // statistic than aggregate P_pos but the more useful one for live
+      // deployment decisions.
+      pPos: num(r.pct_positive),
+      top1Conc: null,
+      betsPerMonth: null,
       resultJson: r as Record<string, unknown>,
       runStartedAt: cfg.run_at ? new Date(String(cfg.run_at)) : new Date(),
     };
   }
-  return { byStrategy: out, meta: { bankroll, stake, spanStart: out[Object.keys(out)[0]]?.dataSpanStart ?? null, spanEnd: out[Object.keys(out)[0]]?.dataSpanEnd ?? null } };
+  return {
+    byStrategy: out,
+    meta: {
+      bankroll,
+      stake,
+      spanStart: out[Object.keys(out)[0]]?.dataSpanStart ?? null,
+      spanEnd: out[Object.keys(out)[0]]?.dataSpanEnd ?? null,
+    },
+  };
 }
 
 async function upsertRun(
