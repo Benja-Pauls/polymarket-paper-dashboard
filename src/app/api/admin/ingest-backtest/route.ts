@@ -74,10 +74,15 @@ function num(v: unknown): number | null {
 }
 
 /**
- * Parser for the deployed-deck comprehensive backtest. Schema is roughly:
- *   { config: { bankroll, stake, span_months, ... },
- *     strategies: { <strategy_id>: { n_bets, n_markets, mean_ret_per_dollar,
- *       total_pnl, p5, p50, p95, p_pos, top1_conc, bets_per_month, ... } } }
+ * Parser for the deployed-deck comprehensive backtest. The actual JSON has
+ * fields nested under .core and .bootstrap (not flat at the strategy root):
+ *   per_strategy.<sid>.core = { n_bets, n_markets, mean_ret, total_pnl,
+ *     win_rate, top1_pct, bets_per_month, ... }
+ *   per_strategy.<sid>.bootstrap = { p5, p50, p95, p_pos }
+ *   per_strategy.<sid>.per_year, .per_month_pnl, .leave_top1_out, .slip_stress_5pct
+ *
+ * `per_strategy_at_50_stake` is the same shape but at $50/bet vs $10. We
+ * default to per_strategy ($10 view) and stash the $50 view in result_json.
  */
 function parseDeployedDeck(json: Record<string, unknown>): {
   byStrategy: Record<string, NewBacktestRun>;
@@ -85,36 +90,58 @@ function parseDeployedDeck(json: Record<string, unknown>): {
 } {
   const cfg = (json.config as Record<string, unknown>) ?? {};
   const bankroll = num(cfg.bankroll) ?? 5000;
-  const stake = num(cfg.stake) ?? 50;
-  const spanStart = (cfg.test_span_start as string) ?? null;
-  const spanEnd = (cfg.test_span_end as string) ?? null;
-  // The actual per-strategy block can live under either `strategies` or `per_strategy` —
-  // try both.
+  const stake = num(cfg.stake) ?? 10;
+  const spanStart =
+    (cfg.test_span_start as string) ??
+    (cfg.span_start as string) ??
+    (cfg.data_span_start as string) ??
+    null;
+  const spanEnd =
+    (cfg.test_span_end as string) ??
+    (cfg.span_end as string) ??
+    (cfg.data_span_end as string) ??
+    null;
   const strats =
-    (json.strategies as Record<string, unknown>) ??
     (json.per_strategy as Record<string, unknown>) ??
+    (json.strategies as Record<string, unknown>) ??
     {};
+  const stratsAt50 =
+    (json.per_strategy_at_50_stake as Record<string, unknown>) ?? {};
   const out: Record<string, NewBacktestRun> = {};
   for (const [sid, raw] of Object.entries(strats)) {
     const r = (raw as Record<string, unknown>) ?? {};
+    // Pull from .core if present (the canonical shape), otherwise read flat.
+    const core = (r.core as Record<string, unknown>) ?? r;
+    const boot = (r.bootstrap as Record<string, unknown>) ?? r;
     out[sid] = {
-      runLabel: "", // filled by caller
+      runLabel: "",
       strategyId: sid,
       dataSpanStart: spanStart,
       dataSpanEnd: spanEnd,
-      nBets: (num(r.n_bets) as number | null) ?? null,
-      nMarkets: (num(r.n_markets) as number | null) ?? null,
+      nBets: num(core.n_bets),
+      nMarkets: num(core.n_markets),
       bankroll,
       stake,
-      meanRetPerDollar: num(r.mean_ret_per_dollar),
-      totalPnl: num(r.total_pnl) ?? num((r as { total_p_l?: number }).total_p_l),
-      p5: num(r.p5) ?? num((r as { p_5?: number }).p_5),
-      p50: num(r.p50) ?? num((r as { p_50?: number }).p_50),
-      p95: num(r.p95) ?? num((r as { p_95?: number }).p_95),
-      pPos: num(r.p_pos),
-      top1Conc: num(r.top1_conc) ?? num(r.top1_concentration),
-      betsPerMonth: num(r.bets_per_month) ?? num(r.bpm),
-      resultJson: r as Record<string, unknown>,
+      // Schema variants: mean_ret OR mean_ret_per_dollar.
+      meanRetPerDollar: num(core.mean_ret) ?? num(core.mean_ret_per_dollar),
+      totalPnl: num(core.total_pnl),
+      p5: num(boot.p5),
+      p50: num(boot.p50),
+      p95: num(boot.p95),
+      pPos: num(boot.p_pos),
+      // top1_pct is reported in PERCENT (3.85), top1_conc is FRACTION (0.0385).
+      // Normalise to fraction so /historical's % formatter renders right.
+      top1Conc: (() => {
+        const pct = num(core.top1_pct);
+        if (pct != null) return pct / 100;
+        return num(core.top1_conc) ?? num(core.top1_concentration);
+      })(),
+      betsPerMonth: num(core.bets_per_month) ?? num(core.bpm),
+      // Stash both views ($10 and $50) so detail pages can switch later.
+      resultJson: {
+        ...r,
+        at_50_stake: stratsAt50[sid] ?? null,
+      } as Record<string, unknown>,
       runStartedAt: cfg.run_at ? new Date(String(cfg.run_at)) : new Date(),
     };
   }
