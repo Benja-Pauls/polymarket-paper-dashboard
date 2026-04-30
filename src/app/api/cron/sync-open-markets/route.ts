@@ -338,13 +338,14 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   const url = new URL(req.url);
-  // Default 20K markets (Gamma's effective maximum at default pagination — see
+  // Default 25K markets (Gamma had ~23K open at last check — see
   // scripts/diag_test_pagination.ts). Was 5000 before; the cap was hitting
   // first because we filled the limit on close-resolving markets and stopped
-  // paging.
+  // paging. The 25K default is comfortably above the actual open-list size,
+  // so pagination will complete naturally and stale-mark can fire safely.
   const maxMarkets = Math.min(
-    Number(url.searchParams.get("max") ?? "20000") || 20000,
-    25_000,
+    Number(url.searchParams.get("max") ?? "25000") || 25000,
+    50_000,
   );
   const llmBudgetUsd = Math.min(
     Number(url.searchParams.get("budget") ?? "5") || 5,
