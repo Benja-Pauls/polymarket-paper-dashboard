@@ -74,20 +74,24 @@ Before:
 | tradeable_political | 598 | 717 | 1316 |
 | **TOTAL NULL** | **1715** | | |
 
-After (one cron-run cycle, run via `scripts/diag_test_fix.ts`):
+After (live prod cron cycle, post-deploy):
 
 | category | n_null | n_archived(ts=0) | n_future | n_total |
 |---|---|---|---|---|
-| tradeable_corporate | 12 | 385 | 221 | 618 |
-| tradeable_crypto | 13 | 2 | 108 | 123 |
-| tradeable_geopolitical | **16** | 635 | 268 | 920 |
-| tradeable_other | 1 | 7 | 45 | 53 |
-| tradeable_political | 3 | 553 | 759 | 1316 |
-| **TOTAL NULL** | **45** | | | |
+| tradeable_corporate | 54 | 385 | 462 | 901 |
+| tradeable_crypto | 16 | 2 | 159 | 177 |
+| tradeable_geopolitical | **26** | 635 | 403 | 1064 |
+| tradeable_other | 4 | 7 | 112 | 123 |
+| tradeable_political | 10 | 553 | 1223 | 1786 |
+| **TOTAL NULL** | **110** | | | |
 
-**680 → 16 on tradeable_geopolitical. 1715 → 45 across all tradeable.**
+**680 → 26 on tradeable_geopolitical. 1715 → 110 across all tradeable.**
 
-`edge_eligible` jumped from 0 to 42 across the last 24h on the
-`/admin/edge-rate` page (`scripts/diag_edge_rate.ts` confirmed pre/post).
-Bets-placed is still 0 because the trades-already-evaluated were against
-a NULL res_ts at decision time — future trades will now be eligible.
+The remaining 110 NULLs will be drained over the next few cron cycles
+because Gamma has ~50K open markets and our maxMarkets=25K cap means
+each run sees half. Cron schedule bumped from 6h → 1h to expedite the
+catch-up.
+
+`edge_eligible` rose from 0 to >40/hr after the deploy; bets-placed
+hit 16 in the most recent hour (post-fix). See `/admin/edge-rate` in
+prod.
