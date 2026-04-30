@@ -337,6 +337,22 @@ async function processStrategyTrade(args: {
       entryTs: trade.timestamp,
       plannedResolutionTs: marketResolutionTs,
     });
+    // Atomically debit cash on the strategies row right after the position
+    // insert. The previous design accumulated `cashSpent` in JS memory and
+    // applied a bulk UPDATE at the end of the cron run — but if the cron
+    // crashed mid-trade-loop (e.g. during the 2026-04-30 Neon-cap incident
+    // where signal INSERTs started failing), positions were persisted but
+    // the cash UPDATE never fired, leaving a phantom $X credit. The
+    // wave9_mirror_geo_v1 strategy ended up $50 over expected (5 × $10
+    // stake). Per-position UPDATE keeps cash honest if the loop is
+    // interrupted at any point.
+    await db
+      .update(strategies)
+      .set({
+        currentCash: sql`${strategies.currentCash} - ${state.strategy.stake}`,
+        updatedAt: new Date(),
+      })
+      .where(eq(strategies.id, state.strategy.id));
     state.cash -= state.strategy.stake;
     state.cashSpent += state.strategy.stake;
     state.nBetsAdded += 1;
@@ -757,15 +773,10 @@ async function runOnce(): Promise<{
   }> = [];
 
   for (const state of states) {
-    if (state.cashSpent > 0) {
-      await db
-        .update(strategies)
-        .set({
-          currentCash: sql`${strategies.currentCash} - ${state.cashSpent}`,
-          updatedAt: new Date(),
-        })
-        .where(eq(strategies.id, state.strategy.id));
-    }
+    // Cash debits already applied per-position in processStrategyTrade —
+    // the bulk UPDATE that used to live here has been removed to prevent
+    // double-debiting. We still track state.cashSpent for the per-strategy
+    // summary counter in the cron response.
 
     const settled = await settleResolvedOpenPositions({
       strategyId: state.strategy.id,
