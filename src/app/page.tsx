@@ -170,10 +170,18 @@ export default async function HomePage() {
                         </p>
                       </div>
                       <div className="text-right">
-                        <p className="text-xs uppercase tracking-wider text-muted-foreground">Bankroll</p>
-                        <p className="font-mono text-sm">
-                          {fmtUsd(sum.cashCurrent + sum.totalOpenStake)} / {fmtUsd(Number(sum.strategy.startingBankroll))}
+                        <p className="text-xs uppercase tracking-wider text-muted-foreground">
+                          Cash / Bankroll
                         </p>
+                        <p className="font-mono text-sm">
+                          {fmtUsd(sum.cashCurrent)} /{" "}
+                          {fmtUsd(Number(sum.strategy.startingBankroll))}
+                        </p>
+                        {sum.nOpen > 0 ? (
+                          <p className="font-mono text-[11px] text-amber-500/80 mt-0.5">
+                            {fmtUsd(sum.totalOpenStake)} in {sum.nOpen} open
+                          </p>
+                        ) : null}
                       </div>
                     </div>
 

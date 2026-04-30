@@ -98,9 +98,13 @@ export default async function StrategyDetailPage({
         />
         <KPI label="Realized P&L" value={fmtUsdSigned(summary.realizedPnl)} />
         <KPI
-          label="Bankroll"
-          value={fmtUsd(summary.cashCurrent + summary.totalOpenStake)}
-          subtitle={`/ ${fmtUsd(Number(strategy.startingBankroll))}`}
+          label="Cash"
+          value={fmtUsd(summary.cashCurrent)}
+          subtitle={
+            summary.totalOpenStake > 0
+              ? `${fmtUsd(summary.totalOpenStake)} in ${summary.nOpen} open · bankroll ${fmtUsd(Number(strategy.startingBankroll))}`
+              : `/ ${fmtUsd(Number(strategy.startingBankroll))} bankroll`
+          }
         />
         <KPI
           label="Bets / hit rate"
