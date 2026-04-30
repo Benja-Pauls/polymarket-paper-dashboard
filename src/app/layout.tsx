@@ -34,15 +34,28 @@ export default function RootLayout({
       <body className="min-h-full flex flex-col bg-background text-foreground">
         <header className="border-b border-border/60 bg-background/80 backdrop-blur sticky top-0 z-30">
           <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3">
-            <Link href="/" className="flex items-center gap-3 font-medium">
-              <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground font-mono text-xs">
-                PM
-              </span>
-              <span className="text-base">Paper Dashboard</span>
-              <span className="ml-2 hidden rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-muted-foreground sm:inline">
-                paper · no real money
-              </span>
-            </Link>
+            <div className="flex items-center gap-6">
+              <Link href="/" className="flex items-center gap-3 font-medium">
+                <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground font-mono text-xs">
+                  PM
+                </span>
+                <span className="text-base">Paper Dashboard</span>
+                <span className="ml-2 hidden rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-muted-foreground sm:inline">
+                  paper · no real money
+                </span>
+              </Link>
+              <nav className="flex gap-4 text-sm text-muted-foreground">
+                <Link href="/" className="hover:text-foreground">
+                  Live
+                </Link>
+                <Link href="/historical" className="hover:text-foreground">
+                  Historical
+                </Link>
+                <Link href="/admin/crons" className="hover:text-foreground">
+                  Crons
+                </Link>
+              </nav>
+            </div>
             <a
               href="https://github.com/Benja-Pauls/polymarket-paper-dashboard"
               target="_blank"

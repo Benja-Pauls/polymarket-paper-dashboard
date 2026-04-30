@@ -200,6 +200,65 @@ export const strategyMethodology = pgTable("strategy_methodology", {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Backtest run: a single historical-backtest result for one strategy on a
+// specific data window. Powers the /historical tab — operators see how each
+// surviving strategy held up across expanding historical windows as the R&D
+// team backfills more data.
+//
+// Workflow:
+//   1. R&D agent runs `scripts/<some_backtest>.py` in the research repo,
+//      producing a JSON file under `results/`.
+//   2. Operator hits POST /api/admin/ingest-backtest with the path to the
+//      JSON (or curls a paste). The endpoint normalises the JSON into one
+//      row per (strategy, run) and writes here.
+//   3. /historical page reads + groups by strategy_id, shows trends over
+//      time (mean ret/$, P5, worst-month) as new rows accumulate.
+//
+// We don't try to enforce a strict numeric schema on the JSON because R&D
+// formats evolve. Instead we hoist the headline metrics into typed columns
+// and stash the full result in result_json for later querying.
+// ─────────────────────────────────────────────────────────────────────────────
+export const backtestRuns = pgTable(
+  "backtest_runs",
+  {
+    id: serial("id").primaryKey(),
+    // Logical run identifier — typically the filename of the JSON the
+    // result came from (e.g. 'backtest_all_deployed.json'). Two different
+    // strategies from the same JSON share the same run_label so they can
+    // be displayed together.
+    runLabel: text("run_label").notNull(),
+    runDescription: text("run_description"),
+    strategyId: text("strategy_id").notNull(),
+    // ISO date strings — keep them as text so we can store exotic spans
+    // ("Jan-Apr 2026 stratified") without forcing a date-typed window.
+    dataSpanStart: text("data_span_start"),
+    dataSpanEnd: text("data_span_end"),
+    // Headline metrics — null when not reported (e.g. pre-bootstrap runs).
+    nBets: integer("n_bets"),
+    nMarkets: integer("n_markets"),
+    bankroll: doublePrecision("bankroll"), // $5,000 default
+    stake: doublePrecision("stake"), // $50 default
+    meanRetPerDollar: doublePrecision("mean_ret_per_dollar"),
+    totalPnl: doublePrecision("total_pnl"),
+    p5: doublePrecision("p5"),
+    p50: doublePrecision("p50"),
+    p95: doublePrecision("p95"),
+    pPos: doublePrecision("p_pos"),
+    top1Conc: doublePrecision("top1_conc"),
+    betsPerMonth: doublePrecision("bets_per_month"),
+    // The full original JSON for this strategy's slice of the run, so we
+    // never lose context.
+    resultJson: jsonb("result_json").$type<Record<string, unknown> | null>(),
+    runStartedAt: timestamp("run_started_at", { withTimezone: true }),
+    ingestedAt: timestamp("ingested_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("backtest_runs_strategy_idx").on(t.strategyId, t.runStartedAt),
+    index("backtest_runs_label_idx").on(t.runLabel),
+  ],
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Cron run: one row per cron-job invocation, written by the handler at the
 // end of each run. Drives the /admin/crons observability page so we can see
 // when each cron last fired, how long it took, and what it returned —
@@ -248,3 +307,5 @@ export type StrategyMethodology = typeof strategyMethodology.$inferSelect;
 export type NewStrategyMethodology = typeof strategyMethodology.$inferInsert;
 export type CronRun = typeof cronRuns.$inferSelect;
 export type NewCronRun = typeof cronRuns.$inferInsert;
+export type BacktestRun = typeof backtestRuns.$inferSelect;
+export type NewBacktestRun = typeof backtestRuns.$inferInsert;
