@@ -59,12 +59,18 @@ type SyncResult = {
   llm_calls_estimated_cost_usd: number;
   upserted: number;
   upserted_with_future_res: number;
+  // Stale-mark pass — tradeable_* markets in our DB whose cid wasn't returned
+  // by today's open-list pagination. Likely closed/archived on Gamma; we mark
+  // them with resolution_timestamp = 0 (sentinel) so strategies skip them.
+  stale_marked: number;
   err?: string;
 };
 
 async function runOnce(opts: {
   maxMarkets: number;
   llmBudgetUsd: number;
+  maxEndDateDays: number | null;
+  staleMark: boolean;
 }): Promise<SyncResult> {
   const result: SyncResult = {
     ok: true,
@@ -76,14 +82,20 @@ async function runOnce(opts: {
     llm_calls_estimated_cost_usd: 0,
     upserted: 0,
     upserted_with_future_res: 0,
+    stale_marked: 0,
   };
 
-  // Step 1: pull open markets from Gamma
+  // Step 1: pull open markets from Gamma. Default cap is 365 days (was 60 — see
+  // diag_resolution_gap.md): nearly all tradeable_geopolitical markets resolve
+  // 90+ days out (e.g. batch end-of-quarter triggers like 2026-07-31), and the
+  // 60-day cap was silently dropping them, leaving 590 of 830 with NULL
+  // resolution_timestamp despite the cron running every 6h.
   let openList: GammaMarket[];
   try {
     openList = await fetchOpenMarkets({
       maxRows: opts.maxMarkets,
       futureOnly: true,
+      maxEndDateDays: opts.maxEndDateDays,
     });
   } catch (e) {
     if (e instanceof GammaUnreachableError) {
@@ -205,7 +217,59 @@ async function runOnce(opts: {
   }
   result.upserted = upserts.length;
 
-  // Step 6: report how many tradeable_* rows now have future resolution.
+  // Step 6: STALE-MARK pass — tradeable_* markets in our DB that did NOT
+  // appear in this open-list pagination are almost certainly CLOSED on Gamma
+  // (and Gamma's `?conditionIds=` filter is broken so we can't verify
+  // individually — see scripts/diag_resolution_gap.md). We sentinel-mark these
+  // with resolution_timestamp = 0 so strategies skip them ("future res" filter
+  // requires resolution_timestamp > now). Without this, lazy-classified markets
+  // that never appear on the open list stay NULL forever, and the
+  // edge-eligible cone is permanently empty.
+  //
+  // Safety: only fire when (a) Gamma returned a healthy open-list count
+  // (>= 1000 markets, indicates we paginated successfully) and (b) we didn't
+  // hit our maxRows ceiling (which would mean we may have stopped before
+  // seeing all open markets).
+  if (
+    opts.staleMark &&
+    result.gamma_reachable &&
+    openList.length >= 1000 &&
+    openList.length < opts.maxMarkets
+  ) {
+    const seenCids = new Set(openList.map((m) => m.conditionId.toLowerCase()));
+    // Pull tradeable_* DB cids with NULL res_ts. Filter out those we just saw.
+    const nullDbRows = await db
+      .select({ cid: markets.conditionId })
+      .from(markets)
+      .where(
+        sql`category in ('tradeable_geopolitical','tradeable_political','tradeable_corporate','tradeable_crypto','tradeable_finance','tradeable_business','tradeable_macro','tradeable_judicial','tradeable_other')
+            and resolution_timestamp is null`,
+      );
+    const stale: string[] = [];
+    for (const r of nullDbRows) {
+      if (!seenCids.has(r.cid.toLowerCase())) stale.push(r.cid);
+    }
+    if (stale.length > 0) {
+      // Bulk update via UNNEST.
+      await db.execute(sql`
+        update markets
+        set resolution_timestamp = 0,
+            updated_at = now()
+        where condition_id = any(${stale}::text[])
+          and resolution_timestamp is null
+      `);
+      console.log(
+        `[sync-open-markets] stale-marked ${stale.length} cids (NULL → 0)`,
+      );
+    }
+    result.stale_marked = stale.length;
+  } else if (opts.staleMark) {
+    console.log(
+      `[sync-open-markets] skipping stale-mark: openList=${openList.length}, maxMarkets=${opts.maxMarkets}, gamma_reachable=${result.gamma_reachable}`,
+    );
+  }
+
+  // Step 7: report how many tradeable_* rows now have future resolution.
   const nowS = Math.floor(Date.now() / 1000);
   const tradeable = await db
     .select({
@@ -226,18 +290,41 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   const url = new URL(req.url);
+  // Default 20K markets (Gamma's effective maximum at default pagination — see
+  // scripts/diag_test_pagination.ts). Was 5000 before; the cap was hitting
+  // first because we filled the limit on close-resolving markets and stopped
+  // paging.
   const maxMarkets = Math.min(
-    Number(url.searchParams.get("max") ?? "5000") || 5000,
-    20_000,
+    Number(url.searchParams.get("max") ?? "20000") || 20000,
+    25_000,
   );
   const llmBudgetUsd = Math.min(
     Number(url.searchParams.get("budget") ?? "5") || 5,
     25,
   );
+  // Default 365d end-date cap (was 60d). Most tradeable_geopolitical markets
+  // resolve 90+ days out (e.g. 2026-07-31 batch trigger), so 60d was silently
+  // dropping ~590 of 830 of them. Override with ?days=N or ?days=null to
+  // disable entirely.
+  const daysParam = url.searchParams.get("days");
+  let maxEndDateDays: number | null = 365;
+  if (daysParam === "null" || daysParam === "0") {
+    maxEndDateDays = null;
+  } else if (daysParam) {
+    const n = Number(daysParam);
+    if (Number.isFinite(n) && n > 0) maxEndDateDays = Math.min(n, 1825);
+  }
+  // Stale-mark pass on by default. ?stale=0 disables it.
+  const staleMark = url.searchParams.get("stale") !== "0";
 
   const t0 = Date.now();
   try {
-    const result = await runOnce({ maxMarkets, llmBudgetUsd });
+    const result = await runOnce({
+      maxMarkets,
+      llmBudgetUsd,
+      maxEndDateDays,
+      staleMark,
+    });
     const elapsedMs = Date.now() - t0;
     console.log(`[cron] sync-open-markets done in ${elapsedMs}ms`, result);
     return NextResponse.json({ ...result, elapsed_ms: elapsedMs });
