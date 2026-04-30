@@ -51,21 +51,37 @@ export function MethodologyTab({ m }: { m: StrategyMethodology }) {
         </CardContent>
       </Card>
 
-      {/* Validation metrics: in-sample + forward */}
+      {/* Validation metrics: bias-adjusted historical + forward 6-mo projection.
+          Updated 2026-04-30 after the inflation-bias audit. The "Historical"
+          block reports stacked-adjusted numbers (cap=100 simultaneous opens
+          on $5K bankroll + 5% extra slippage) over the full 37mo expanded
+          universe — what the strategy WOULD HAVE earned if you'd actually
+          deployed it then. The "Forward 6mo" block linear-extrapolates the
+          observed year-over-year mean-ret/$ decay to project realistic
+          deployment expectations. */}
       <Card className="border-border/60">
         <CardHeader>
-          <CardTitle className="text-base">Validation metrics</CardTitle>
+          <CardTitle className="text-base">Performance &amp; deployment expectation</CardTitle>
           <CardDescription>
-            In-sample numbers come from the 21-month research backtest. Forward-OOS
-            numbers come from the 2026 walk-forward held out for validation.
+            Historical block: bias-adjusted P&amp;L (cap=100 + 5% extra slippage)
+            on the 37mo expanded universe. Forward block: 6-month projection
+            extrapolating the per-year mean-ret/$ decay trajectory — the
+            realistic next-6-month deployment expectation, not a guarantee.
           </CardDescription>
         </CardHeader>
         <Separator />
         <CardContent className="pt-6">
           <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-            <MetricsBlock title="In-sample" metrics={inSample} />
-            <MetricsBlock title="Forward-OOS" metrics={forward} accent />
+            <MetricsBlock title="Historical (bias-adjusted)" metrics={inSample} />
+            <MetricsBlock title="Forward 6mo (projected)" metrics={forward} accent />
           </div>
+          <p className="mt-4 text-[11px] text-muted-foreground leading-relaxed max-w-2xl">
+            <span className="font-medium text-foreground">P5 explained:</span>{" "}
+            The 5th-percentile of a bootstrap distribution — in 95% of
+            historical-resample scenarios the total P&amp;L was at least this much.
+            It&apos;s the conservative-floor of the historical confidence interval,
+            not a guarantee of future performance.
+          </p>
         </CardContent>
       </Card>
 
