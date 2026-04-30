@@ -110,13 +110,31 @@ async function runOnce(opts: {
   result.open_markets_seen = openList.length;
   console.log(`[sync-open-markets] gamma: ${openList.length} open markets`);
 
-  // Step 2: split markets into (already-labelled by static index) vs (needs LLM)
+  // Step 2a: pre-load existing DB categories so we skip LLM for any cid we
+  // already know. This is the critical perf fix — without it, with 20K open
+  // markets, even with 80% in static labels we'd still pay LLM cost on ~4K
+  // markets, blowing the 5-min Vercel function budget.
+  const dbCidSet = new Set<string>();
+  if (openList.length > 0) {
+    const allCids = openList.map((m) => m.conditionId.toLowerCase());
+    // Postgres ANY() handles up to ~32K params.
+    const known = await db
+      .select({ cid: markets.conditionId })
+      .from(markets)
+      .where(sql`condition_id = any(${allCids}::text[]) and category is not null`);
+    for (const r of known) dbCidSet.add(r.cid.toLowerCase());
+  }
+
+  // Step 2b: split markets into (already-labelled by static index OR DB) vs (needs LLM)
   type Pending = {
     cid: string;
     question: string | null;
     endTs: number | null;
   };
-  const labelled: Array<Pending & { category: string }> = [];
+  // Markets with a known category (static or DB) — we still upsert them (so
+  // res_ts gets refreshed) but DON'T pay LLM cost. category=null is fine here
+  // because the upsert COALESCE preserves the existing DB value.
+  const labelled: Array<Pending & { category: string | null }> = [];
   const needsLlm: Pending[] = [];
 
   for (const m of openList) {
@@ -125,29 +143,44 @@ async function runOnce(opts: {
     const staticCat = lookupStaticLabel(cid);
     if (staticCat) {
       labelled.push({ cid, question: m.question, endTs, category: staticCat });
+    } else if (dbCidSet.has(cid)) {
+      // Already classified in DB; pass category=null and let COALESCE preserve it.
+      labelled.push({ cid, question: m.question, endTs, category: null });
     } else if ((m.question ?? "").trim()) {
       needsLlm.push({ cid, question: m.question, endTs });
     }
-    // markets with no question text + no static label are dropped
+    // markets with no question text + no static label + no DB row are dropped
   }
   result.matched_static_labels = labelled.length;
   console.log(
-    `[sync-open-markets] matched ${labelled.length} via static labels, ${needsLlm.length} need LLM`,
+    `[sync-open-markets] matched ${labelled.length} (static OR pre-classified in DB), ${needsLlm.length} need LLM`,
   );
 
-  // Step 3: LLM-classify the rest if Anthropic key is available
+  // Step 3: LLM-classify the rest if Anthropic key is available. Hard cap of
+  // 1500 LLM calls per cron run to leave headroom for the rest of the work
+  // (classify ~300ms/call × 1500 / 8 concurrency ≈ 56s, well under maxDuration).
+  // Newly-introduced markets between runs are typically << 1500.
+  const MAX_LLM_CALLS_PER_RUN = 1500;
+  const llmItems = needsLlm.slice(0, MAX_LLM_CALLS_PER_RUN);
+  if (needsLlm.length > MAX_LLM_CALLS_PER_RUN) {
+    result.classified_skipped_budget = needsLlm.length - MAX_LLM_CALLS_PER_RUN;
+    console.warn(
+      `[sync-open-markets] capping LLM calls at ${MAX_LLM_CALLS_PER_RUN} (deferring ${result.classified_skipped_budget} to next run)`,
+    );
+  }
   const llmResults = new Map<string, string | null>();
-  if (process.env.ANTHROPIC_API_KEY && needsLlm.length > 0) {
-    const before = needsLlm.length;
+  if (process.env.ANTHROPIC_API_KEY && llmItems.length > 0) {
+    const before = llmItems.length;
     try {
       const m = await classifyMany({
-        items: needsLlm.map((p) => ({ conditionId: p.cid, question: p.question })),
+        items: llmItems.map((p) => ({ conditionId: p.cid, question: p.question })),
         concurrency: 8,
         budgetUsd: opts.llmBudgetUsd,
       });
       for (const [k, v] of m.entries()) llmResults.set(k, v);
       result.classified_via_llm = Array.from(m.values()).filter(Boolean).length;
-      result.classified_skipped_budget = Math.max(0, before - m.size);
+      // Track budget-cap separately from the run-cap above.
+      result.classified_skipped_budget += Math.max(0, before - m.size);
       result.llm_calls_estimated_cost_usd = Number(
         (m.size * 0.0002).toFixed(4),
       );
@@ -174,6 +207,10 @@ async function runOnce(opts: {
       category: r.category,
     });
   }
+  // Include all needsLlm cids (even those deferred past MAX_LLM_CALLS_PER_RUN)
+  // — we still want to register the cid + endTs in the DB so subsequent runs
+  // see them. Deferred ones get category=null and will be re-attempted next
+  // run. The COALESCE in the upsert preserves any existing category.
   for (const p of needsLlm) {
     const cat = llmResults.get(p.cid) ?? null;
     upserts.push({
