@@ -33,6 +33,7 @@ import {
   type GammaMarket,
 } from "@/lib/gamma";
 import { lookupStaticLabel, classifyMany } from "@/lib/classify";
+import { recordCronRun } from "@/lib/cron-tracker";
 
 export const runtime = "nodejs";
 export const maxDuration = 300; // 5 minutes
@@ -319,12 +320,16 @@ export async function GET(req: Request) {
 
   const t0 = Date.now();
   try {
-    const result = await runOnce({
-      maxMarkets,
-      llmBudgetUsd,
-      maxEndDateDays,
-      staleMark,
-    });
+    // Wrap in recordCronRun so /admin/crons sees the run history. The wrapper
+    // captures start/finish/duration/status/result_json automatically.
+    const result = await recordCronRun("sync-open-markets", () =>
+      runOnce({
+        maxMarkets,
+        llmBudgetUsd,
+        maxEndDateDays,
+        staleMark,
+      }),
+    );
     const elapsedMs = Date.now() - t0;
     console.log(`[cron] sync-open-markets done in ${elapsedMs}ms`, result);
     return NextResponse.json({ ...result, elapsed_ms: elapsedMs });
