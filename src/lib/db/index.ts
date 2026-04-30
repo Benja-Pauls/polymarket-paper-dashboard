@@ -16,4 +16,9 @@ if (!databaseUrl) {
 
 const sql = neon(databaseUrl);
 export const db = drizzle(sql, { schema, casing: "snake_case" });
+// Raw neon sql client — for queries that need text[] / int[] array params.
+// Drizzle's sql template unrolls JS arrays into individual `$N` params, which
+// breaks `condition_id = any($1::text[])` patterns. The neon client's tagged
+// template handles arrays as a single param.
+export const sqlRaw = sql;
 export { schema };

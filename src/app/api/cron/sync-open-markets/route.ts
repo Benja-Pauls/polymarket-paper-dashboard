@@ -24,7 +24,7 @@
 import { NextResponse } from "next/server";
 import { sql } from "drizzle-orm";
 
-import { db } from "@/lib/db";
+import { db, sqlRaw } from "@/lib/db";
 import { markets } from "@/lib/db/schema";
 import {
   fetchOpenMarkets,
@@ -114,15 +114,18 @@ async function runOnce(opts: {
   // already know. This is the critical perf fix — without it, with 20K open
   // markets, even with 80% in static labels we'd still pay LLM cost on ~4K
   // markets, blowing the 5-min Vercel function budget.
+  //
+  // We do this in JS (no DB roundtrip). It's actually simpler — we just need
+  // to know which cids already have a category in the DB. Pull all cids+cats
+  // for tradeable + ambiguous + unknown categories (everything we'd skip LLM
+  // on). For 5-10K rows this is one cheap SELECT.
   const dbCidSet = new Set<string>();
   if (openList.length > 0) {
-    const allCids = openList.map((m) => m.conditionId.toLowerCase());
-    // Postgres ANY() handles up to ~32K params.
-    const known = await db
+    const knownRes = await db
       .select({ cid: markets.conditionId })
       .from(markets)
-      .where(sql`condition_id = any(${allCids}::text[]) and category is not null`);
-    for (const r of known) dbCidSet.add(r.cid.toLowerCase());
+      .where(sql`category is not null`);
+    for (const r of knownRes) dbCidSet.add(r.cid.toLowerCase());
   }
 
   // Step 2b: split markets into (already-labelled by static index OR DB) vs (needs LLM)
@@ -288,14 +291,21 @@ async function runOnce(opts: {
       if (!seenCids.has(r.cid.toLowerCase())) stale.push(r.cid);
     }
     if (stale.length > 0) {
-      // Bulk update via UNNEST.
-      await db.execute(sql`
-        update markets
-        set resolution_timestamp = 0,
-            updated_at = now()
-        where condition_id = any(${stale}::text[])
-          and resolution_timestamp is null
-      `);
+      // Bulk update via raw neon (drizzle unrolls JS arrays into tuple params,
+      // which breaks `any($1::text[])`). Process in chunks of 5K to stay under
+      // any URL/query-size limits — Neon HTTP has a generous limit but no need
+      // to be aggressive.
+      const CHUNK = 5000;
+      for (let i = 0; i < stale.length; i += CHUNK) {
+        const slice = stale.slice(i, i + CHUNK);
+        await sqlRaw`
+          update markets
+          set resolution_timestamp = 0,
+              updated_at = now()
+          where condition_id = any(${slice}::text[])
+            and resolution_timestamp is null
+        `;
+      }
       console.log(
         `[sync-open-markets] stale-marked ${stale.length} cids (NULL → 0)`,
       );
