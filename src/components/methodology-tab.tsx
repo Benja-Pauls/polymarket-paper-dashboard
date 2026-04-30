@@ -152,6 +152,10 @@ export function MethodologyTab({ m }: { m: StrategyMethodology }) {
 export function BarStatusBadge({ status }: { status: string }) {
   // Tone the badge by status. We use semantic colour classes so the badge stays
   // legible in dark + light theme.
+  // 'redundant' and 'failed' added 2026-04-30 after the comprehensive
+  // 10-strategy backtest (results/backtest_all_deployed.md) found that
+  // geo_v3/v4 catalyst-gated FAIL Bar-1 and several others are dominated
+  // subsets of stronger variants.
   const tone = (() => {
     switch (status) {
       case "Bar 2 alpha":
@@ -160,6 +164,10 @@ export function BarStatusBadge({ status }: { status: string }) {
         return "bg-sky-500/15 text-sky-300 border border-sky-500/30";
       case "borderline":
         return "bg-amber-500/15 text-amber-300 border border-amber-500/30";
+      case "redundant":
+        return "bg-zinc-500/15 text-zinc-400 border border-zinc-500/30";
+      case "failed":
+        return "bg-red-500/15 text-red-300 border border-red-500/40";
       case "comparison":
         return "bg-muted text-muted-foreground border border-border/60";
       default:

@@ -32,6 +32,16 @@ export const config: VercelConfig = {
       // markets that drifted into our DB via lazy-classify.
       schedule: "0 * * * *",
     },
+    {
+      // Daily skip-signal prune. Without it the signals table grows ~1.5M
+      // rows / day at the current poll rate (10 strategies × ~1500 trades ×
+      // 96 polls/day ≈ 1.4M rows/day) and hit the Neon Hobby 512MB cap on
+      // 2026-04-30. Retention: 24h. Bet signals (FK-referenced by positions)
+      // are never deleted.
+      path: "/api/cron/prune-signals",
+      // 06:00 UTC = 1 AM CST — quiet window between active polls.
+      schedule: "0 6 * * *",
+    },
   ],
 };
 

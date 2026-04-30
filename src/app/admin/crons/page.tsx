@@ -41,10 +41,18 @@ const CRONS: CronDef[] = [
   {
     name: "sync-open-markets",
     path: "/api/cron/sync-open-markets",
-    schedule: "0 */6 * * *",
-    schedule_human: "every 6 hours",
+    schedule: "0 * * * *",
+    schedule_human: "every hour",
     description:
-      "Refreshes the OPEN-markets universe from Polymarket Gamma. For each open market: looks up its category in the static label index (free), falls back to Claude Haiku 4.5 (~$0.0001/market). Upserts (condition_id, question_text, category, resolution_timestamp) so strategies have endDate to filter on.",
+      "Refreshes the OPEN-markets universe from Polymarket Gamma. For each open market: looks up its category in the static label index (free), falls back to Claude Haiku 4.5 (~$0.0001/market). Upserts (condition_id, question_text, category, resolution_timestamp) so strategies have endDate to filter on. Bumped 6h→1h on 2026-04-29 after the resolution-ts gap fix; 1500 LLM calls/run, hourly cadence drains the LLM-needed backlog faster.",
+  },
+  {
+    name: "prune-signals",
+    path: "/api/cron/prune-signals",
+    schedule: "0 6 * * *",
+    schedule_human: "daily at 1 AM CST",
+    description:
+      "Deletes skip signals older than 24h to keep the DB under Neon's 512 MB cap. Without it the signals table grows ~1.5M rows/day (10 strategies × 1500 trades × 96 polls). Bet signals (FK-referenced by positions) are never deleted. Plain VACUUM after delete to free in-table space; explicit VACUUM FULL is reserved for manual operator action.",
   },
 ];
 
