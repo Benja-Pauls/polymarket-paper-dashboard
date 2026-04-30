@@ -81,6 +81,25 @@ export type StrategyParams = {
    */
   require_real_catalyst_source?: boolean;
   /**
+   * MIRROR-FAVORITE (Wave 9).  When set, BUY trades at price ≥ this threshold
+   * are interpreted as a synthetic "BUY the OTHER outcome at (1 - price)"
+   * signal — i.e., the favorite was bought, so we mirror to a longshot bet.
+   *
+   * Backtest finding (results/wave9_mirror_favorite.md, 21mo test):
+   *   Standalone mirror (orig ep in (0.60, 0.95)): mean ret/$ +0.507, 1252
+   *     bets, P5 +$9,542 on $5K bankroll, P_pos 0.994 — Bar-1 PASS.
+   *   Combined direct + mirror: P5 +$27,377, 2134 bets, mean ret/$ +0.555.
+   *   Geo-only mirror is the strongest: +0.733 ret/$ on 542 bets.
+   *
+   * When this is set together with ep_lo / ep_hi, the SYNTHESIZED entry price
+   * (= 1 - orig_price) must satisfy [ep_lo, ep_hi). E.g. mirror_min=0.60
+   * + ep [0.10, 0.40) means we accept BUYs at orig price in (0.60, 0.90].
+   *
+   * Only applies to side=BUY trades. SELLs go through the existing
+   * SELL-side mirror logic (entryPrice = 1 - price, betOutcome = 1 - idx).
+   */
+  mirror_favorite_min_orig_price?: number | null;
+  /**
    * Optional list of question-pattern category names to EXCLUDE. Each name
    * maps to a regex defined in `QUESTION_EXCLUSION_PATTERNS` below. If the
    * market's `question_text` matches any of the listed patterns, the trade
@@ -459,8 +478,23 @@ export function evaluateTrade(args: {
     return { action: "skip", reason: `price out of bounds: ${price}` };
   }
 
-  const entryPrice = side === "BUY" ? price : 1 - price;
-  const betOutcome = side === "BUY" ? outcomeIdx : 1 - outcomeIdx;
+  // Default longshot-side computation: BUY at p → bet outcomeIdx at p,
+  // SELL at p → bet (1-outcomeIdx) at (1-p). The mirror-favorite block
+  // below overrides this for high-price BUYs when the strategy opts in.
+  let entryPrice = side === "BUY" ? price : 1 - price;
+  let betOutcome = side === "BUY" ? outcomeIdx : 1 - outcomeIdx;
+
+  // MIRROR-FAVORITE (Wave 9): when a BUY is on the favorite side at price ≥
+  // mirror_min, treat it as a synthetic SELL signal (bet on the OTHER outcome
+  // at 1-price). This captures the bias from the opposite angle and 5-10x's
+  // bet rate. Doesn't fire for SELLs (those already get the equivalent
+  // transformation above) or for BUYs below the threshold (which are already
+  // longshot trades and go through the direct path).
+  const mirrorMin = params.mirror_favorite_min_orig_price ?? null;
+  if (mirrorMin != null && side === "BUY" && price >= mirrorMin) {
+    entryPrice = 1 - price;
+    betOutcome = 1 - outcomeIdx;
+  }
 
   if (marketCategory == null) {
     return { action: "skip", reason: "market not in tradeable_*", entryPrice, betOutcome };
