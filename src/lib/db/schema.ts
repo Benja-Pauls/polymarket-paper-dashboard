@@ -200,6 +200,36 @@ export const strategyMethodology = pgTable("strategy_methodology", {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cron run: one row per cron-job invocation, written by the handler at the
+// end of each run. Drives the /admin/crons observability page so we can see
+// when each cron last fired, how long it took, and what it returned —
+// without having to wade through Vercel logs.
+// ─────────────────────────────────────────────────────────────────────────────
+export const cronRuns = pgTable(
+  "cron_runs",
+  {
+    id: serial("id").primaryKey(),
+    // Logical name of the cron, e.g. 'poll' or 'sync-open-markets'. Matches
+    // the URL path segment under /api/cron/<name>.
+    cronName: text("cron_name").notNull(),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }).notNull(),
+    durationMs: integer("duration_ms").notNull(),
+    // 'ok' | 'error' — split out so the dashboard can colour-code at a glance.
+    status: text("status").notNull(),
+    // Free-form structured result (e.g. trades_fetched, bets_placed). Keep
+    // it small — the cron handlers only return summary counters anyway.
+    resultJson: jsonb("result_json").$type<Record<string, unknown> | null>(),
+    // Truncated error message when status='error'. Full stack stays in logs.
+    errorMessage: text("error_message"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("cron_runs_name_started_idx").on(t.cronName, t.startedAt),
+  ],
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Type exports
 // ─────────────────────────────────────────────────────────────────────────────
 export type Strategy = typeof strategies.$inferSelect;
@@ -216,3 +246,5 @@ export type MarketCatalyst = typeof marketCatalysts.$inferSelect;
 export type NewMarketCatalyst = typeof marketCatalysts.$inferInsert;
 export type StrategyMethodology = typeof strategyMethodology.$inferSelect;
 export type NewStrategyMethodology = typeof strategyMethodology.$inferInsert;
+export type CronRun = typeof cronRuns.$inferSelect;
+export type NewCronRun = typeof cronRuns.$inferInsert;

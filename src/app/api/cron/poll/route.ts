@@ -44,6 +44,7 @@ import {
   type StrategyParams,
 } from "@/lib/strategy";
 import { classifyMany, lookupStaticLabel } from "@/lib/classify";
+import { recordCronRun } from "@/lib/cron-tracker";
 
 export const runtime = "nodejs";
 export const maxDuration = 300; // 5 minutes
@@ -820,7 +821,9 @@ export async function GET(req: Request) {
   }
   const t0 = Date.now();
   try {
-    const result = await runOnce();
+    // recordCronRun wraps the work and persists a row in cron_runs (powers
+    // the /admin/crons observability page).
+    const result = await recordCronRun("poll", () => runOnce());
     const elapsedMs = Date.now() - t0;
     console.log(`[cron] poll done in ${elapsedMs}ms`, result);
     return NextResponse.json({ ...result, elapsed_ms: elapsedMs });

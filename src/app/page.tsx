@@ -7,7 +7,10 @@ import {
   listStrategyBarStatuses,
 } from "@/lib/queries";
 import type { Strategy } from "@/lib/db/schema";
-import { fmtUsd, fmtPct, fmtUsdSigned } from "@/lib/format";
+import { cronRuns } from "@/lib/db/schema";
+import { fmtUsd, fmtPct, fmtUsdSigned, fmtAgo, fmtCountdown, nextCronFire, fmtCST } from "@/lib/format";
+import { db } from "@/lib/db";
+import { desc, eq } from "drizzle-orm";
 import { Sparkline } from "@/components/sparkline";
 import { BarStatusBadge } from "@/components/methodology-tab";
 import { Separator } from "@/components/ui/separator";
@@ -15,7 +18,15 @@ import { Separator } from "@/components/ui/separator";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
+// Cron schedules — kept in lockstep with vercel.ts. The home-page status widget
+// uses these to render countdowns; the full /admin/crons page has descriptions.
+const HOME_CRONS = [
+  { name: "poll", label: "Trade poll", schedule: "*/15 * * * *" },
+  { name: "sync-open-markets", label: "Market sync", schedule: "0 */6 * * *" },
+] as const;
+
 export default async function HomePage() {
+  const nowMs = Date.now();
   let strategies: Strategy[] = [];
   let dbError: string | null = null;
   try {
@@ -24,7 +35,7 @@ export default async function HomePage() {
     dbError = (e as Error).message;
   }
 
-  const [summaries, barStatuses] = await Promise.all([
+  const [summaries, barStatuses, cronStatus] = await Promise.all([
     Promise.all(
       strategies.map(async (s) => {
         try {
@@ -35,17 +46,69 @@ export default async function HomePage() {
       }),
     ),
     listStrategyBarStatuses().catch(() => ({}) as Record<string, string>),
+    Promise.all(
+      HOME_CRONS.map(async (c) => {
+        try {
+          const r = await db
+            .select()
+            .from(cronRuns)
+            .where(eq(cronRuns.cronName, c.name))
+            .orderBy(desc(cronRuns.startedAt))
+            .limit(1);
+          return { cron: c, last: r[0] ?? null };
+        } catch {
+          return { cron: c, last: null };
+        }
+      }),
+    ),
   ]);
 
   return (
     <div className="space-y-8">
-      <section>
-        <h1 className="text-3xl font-semibold tracking-tight">Model leaderboard</h1>
-        <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
-          Paper-money trading strategies for Polymarket prediction markets. The cron polls
-          Goldsky on schedule for new on-chain trades and applies each strategy&apos;s filter
-          to virtual capital. <span className="font-medium text-foreground">No real money is ever placed.</span>
-        </p>
+      <section className="flex flex-wrap items-start justify-between gap-6">
+        <div>
+          <h1 className="text-3xl font-semibold tracking-tight">Model leaderboard</h1>
+          <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
+            Paper-money trading strategies for Polymarket prediction markets. The cron polls
+            Polymarket data-api on schedule for new on-chain trades and applies each strategy&apos;s
+            filter to virtual capital. <span className="font-medium text-foreground">No real money is ever placed.</span>
+          </p>
+        </div>
+        <Card className="min-w-[280px] border-border/70 bg-card/40">
+          <CardContent className="p-4 space-y-2 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-foreground">Cron status</span>
+              <Link href="/admin/crons" className="text-muted-foreground hover:underline">
+                details →
+              </Link>
+            </div>
+            {cronStatus.map(({ cron, last }) => {
+              const next = nextCronFire(cron.schedule, nowMs);
+              const lastOk = last?.status === "ok";
+              return (
+                <div key={cron.name} className="space-y-0.5">
+                  <div className="flex items-center justify-between font-mono">
+                    <span className="text-muted-foreground">{cron.label}</span>
+                    <span className={lastOk ? "text-emerald-500" : last ? "text-red-500" : "text-muted-foreground"}>
+                      {last ? (lastOk ? "OK" : "ERR") : "—"}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                    <span>
+                      last: {last ? fmtAgo(last.startedAt, nowMs) : "never"}
+                    </span>
+                    <span>
+                      next: {next ? fmtCountdown(next, nowMs) : "—"}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+            <div className="text-[10px] text-muted-foreground pt-1 border-t border-border/40 mt-2">
+              {fmtCST(new Date(nowMs))}
+            </div>
+          </CardContent>
+        </Card>
       </section>
 
       {dbError ? (
