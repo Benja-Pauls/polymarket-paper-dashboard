@@ -39,8 +39,11 @@ export const config: VercelConfig = {
       // 2026-04-30. Retention: 24h. Bet signals (FK-referenced by positions)
       // are never deleted.
       path: "/api/cron/prune-signals",
-      // 06:00 UTC = 1 AM CST — quiet window between active polls.
-      schedule: "0 6 * * *",
+      // Every 4 hours — daily wasn't enough; signals grow ~1.5M rows/day at
+      // the current poll rate (10 strategies × 1500 trades × 96 polls) and
+      // we hit the Neon 512MB cap on 2026-04-30 AND 2026-05-01. 4-hourly
+      // keeps the table under ~250K rows.
+      schedule: "0 */4 * * *",
     },
   ],
 };
