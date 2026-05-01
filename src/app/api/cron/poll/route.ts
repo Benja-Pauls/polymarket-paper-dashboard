@@ -256,6 +256,7 @@ async function processStrategyTrade(args: {
   marketCatalystTs: number | null;
   marketCatalystSource: string | null;
   marketQuestionText: string | null;
+  marketCreatedAt: number | null;
 }): Promise<void> {
   const {
     state,
@@ -266,6 +267,7 @@ async function processStrategyTrade(args: {
     marketCatalystTs,
     marketCatalystSource,
     marketQuestionText,
+    marketCreatedAt,
   } = args;
 
   if (trade.timestamp <= (state.strategy.lastPollTs ?? 0)) {
@@ -290,6 +292,7 @@ async function processStrategyTrade(args: {
     marketCatalystTs,
     marketCatalystSource,
     marketQuestionText,
+    marketCreatedAt,
     cash: state.cash,
     stake: state.strategy.stake,
     params: state.params,
@@ -656,6 +659,10 @@ async function runOnce(): Promise<{
       resolved: number;
       runningVolumeUsdc: number;
       questionText: string | null;
+      // Wave-11: when the dashboard FIRST saw the market. Used by the
+      // min_market_lifespan_hours filter to detect oracle/resolution-date
+      // mismatches.
+      createdAt: number | null;
     }
   >();
   if (uniqueCids.length > 0) {
@@ -670,6 +677,7 @@ async function runOnce(): Promise<{
         resolved: m.resolved ?? 0,
         runningVolumeUsdc: Number(m.runningVolumeUsdc ?? 0),
         questionText: m.questionText ?? null,
+        createdAt: m.createdAt ? Math.floor(m.createdAt.getTime() / 1000) : null,
       });
     }
   }
@@ -708,6 +716,7 @@ async function runOnce(): Promise<{
     const category = meta?.resolved ? null : meta?.category ?? null;
     const resolutionTs = meta?.resolutionTs ?? null;
     const questionText = meta?.questionText ?? null;
+    const createdAt = meta?.createdAt ?? null;
     const catalystEntry = catalystCache.get(trade.conditionId);
     const catalystTs = catalystEntry?.ts ?? null;
     const catalystSource = catalystEntry?.source ?? null;
@@ -722,6 +731,7 @@ async function runOnce(): Promise<{
         marketCatalystTs: catalystTs,
         marketCatalystSource: catalystSource,
         marketQuestionText: questionText,
+        marketCreatedAt: createdAt,
       });
     }
 
@@ -735,6 +745,7 @@ async function runOnce(): Promise<{
         resolved: 0,
         runningVolumeUsdc: newVol,
         questionText: null,
+        createdAt: null,
       });
   }
 

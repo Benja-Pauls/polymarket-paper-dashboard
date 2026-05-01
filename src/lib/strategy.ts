@@ -120,8 +120,24 @@ export type StrategyParams = {
    *   - diplomatic
    *   - election
    *   - price_threshold
+   *   - daily_action  (Wave-11 trader-expert addition: catches "Will X
+   *     [verb] [Y] [today/tomorrow/specific-date]" patterns)
    */
   exclude_question_patterns?: string[];
+  /**
+   * Wave-11 trader-expert addition (2026-05-01): minimum hours between when
+   * the dashboard FIRST SAW the market and when it resolves. Catches
+   * "oracle/resolution-date mismatches" — markets where resolution_timestamp
+   * fires BEFORE the natural event date encoded in the question (e.g. VA
+   * Senate primary res_ts June 16 when primary is August 4). The market
+   * resolves "no" by default before the event happens; our bet has no
+   * chance.
+   *
+   * The check: `(resolution_timestamp - market.created_at) >=
+   * min_market_lifespan_hours * 3600`. Default null = no check (existing
+   * strategies pre-Wave-11). v11_best_combined opts into 48h.
+   */
+  min_market_lifespan_hours?: number | null;
 };
 
 /**
@@ -152,6 +168,16 @@ export const QUESTION_EXCLUSION_PATTERNS: Record<string, RegExp> = {
     /\b(elected|election|presiden|prime minister|wins\s+race|lose\s+race|primary)/i,
   price_threshold:
     /\b(price|hit|reach|exceed|cross|bitcoin|ethereum|btc|eth|stock|all.time|index)/i,
+  // Wave-11 trader-expert filter (added 2026-05-01).
+  // Catches "Will X [verb] [Y] [today/tomorrow/specific date]" — daily-action
+  // bets on calendar certainty (e.g. "Will Trump insult someone on May 6?").
+  // Discretionary review showed our model loses ~12¢/$ EV on these by buying
+  // NO at 14¢ when the implied YES probability is 95%+. There's no
+  // favorite-longshot bias to recover the loss because the action ISN'T a
+  // surprising longshot — it's a virtual certainty. v11_best_combined opts
+  // into this filter; older strategies don't (preserves their live data).
+  daily_action:
+    /\b(insult|tweets?|posts?|comments?|wears?|kiss|hug|attend|appear|references?|mentions?|calls?|talks? to|meets? with)\b.*\b(today|tomorrow|tonight|this (morning|afternoon|evening|week|weekend)|may \d{1,2}|june \d{1,2}|july \d{1,2})\b/i,
 };
 
 /**
@@ -444,6 +470,13 @@ export function evaluateTrade(args: {
    * named regex in `QUESTION_EXCLUSION_PATTERNS`.
    */
   marketQuestionText?: string | null;
+  /**
+   * When the dashboard FIRST saw this market (unix seconds). Used by Wave-11
+   * `min_market_lifespan_hours` filter to catch oracle/resolution-date
+   * mismatches where resolution_timestamp fires before the natural event
+   * date. Pass null/undefined when unknown; the filter then no-ops.
+   */
+  marketCreatedAt?: number | null;
   cash: number;
   stake: number;
   params: StrategyParams;
@@ -457,6 +490,7 @@ export function evaluateTrade(args: {
     marketCatalystTs,
     marketCatalystSource,
     marketQuestionText,
+    marketCreatedAt,
     cash,
     stake,
     params,
@@ -647,6 +681,29 @@ export function evaluateTrade(args: {
       return {
         action: "skip",
         reason: `question matches excluded pattern: ${matched}`,
+        entryPrice,
+        betOutcome,
+      };
+    }
+  }
+  // Wave-11 trader-expert filter: minimum market lifespan check.
+  // Skips markets where resolution fires before the natural event would
+  // happen — catches oracle/resolution-date mismatches the trading-expert
+  // audit flagged (e.g. VA Senate primary res_ts BEFORE the primary date).
+  // Implementation: require (resolution_timestamp - market_created_at) ≥
+  // threshold_hours. Skipped silently if marketCreatedAt isn't known.
+  if (
+    typeof params.min_market_lifespan_hours === "number" &&
+    params.min_market_lifespan_hours > 0 &&
+    marketCreatedAt != null &&
+    marketResolutionTs != null
+  ) {
+    const lifespanHours =
+      (marketResolutionTs - marketCreatedAt) / 3600;
+    if (lifespanHours < params.min_market_lifespan_hours) {
+      return {
+        action: "skip",
+        reason: `market lifespan ${lifespanHours.toFixed(1)}h < ${params.min_market_lifespan_hours}h (oracle/res-date mismatch suspected)`,
         entryPrice,
         betOutcome,
       };
