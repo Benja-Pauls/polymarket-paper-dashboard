@@ -259,6 +259,44 @@ export const backtestRuns = pgTable(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Forward-OOS validation log: one row per (strategy, validation_run). The
+// dashboard cron's `processStrategyTrade` checks for a recent (≤14d old)
+// validation row before treating a strategy with status='active' as
+// deployable. Process fix #1 (2026-05-01): prevents the v12 process error
+// where I deployed a strategy live before its forward-OOS validation
+// finished. The pre-registered gates from `experiments/<date>_<id>.md` are
+// recorded here as `gates_passed` JSONB so reviewers can audit.
+//
+// Application-layer enforcement (TS code in cron handler) — not a Postgres
+// CHECK constraint because constraints can't reference other tables. The
+// runtime check is: when a cron processes a strategy with
+// `requires_oos_validation=true` flag, look up the latest validation row;
+// reject (force halt) if none within 14 days.
+// ─────────────────────────────────────────────────────────────────────────────
+export const forwardOosValidations = pgTable(
+  "forward_oos_validations",
+  {
+    id: serial("id").primaryKey(),
+    strategyId: text("strategy_id")
+      .notNull()
+      .references(() => strategies.id, { onDelete: "cascade" }),
+    runLabel: text("run_label").notNull(),
+    validatedAt: timestamp("validated_at", { withTimezone: true }).notNull(),
+    // Pre-registered gates from experiments/<date>_<id>.md. Each entry:
+    // { name, threshold, observed, passed }.
+    gatesPassed: jsonb("gates_passed").$type<
+      Array<{ name: string; threshold: number; observed: number; passed: boolean }>
+    >(),
+    overallVerdict: text("overall_verdict").notNull(), // 'DEPLOY' | 'HOLD' | 'KILL'
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("forward_oos_strategy_idx").on(t.strategyId, t.validatedAt),
+  ],
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Cron run: one row per cron-job invocation, written by the handler at the
 // end of each run. Drives the /admin/crons observability page so we can see
 // when each cron last fired, how long it took, and what it returned —
@@ -307,5 +345,7 @@ export type StrategyMethodology = typeof strategyMethodology.$inferSelect;
 export type NewStrategyMethodology = typeof strategyMethodology.$inferInsert;
 export type CronRun = typeof cronRuns.$inferSelect;
 export type NewCronRun = typeof cronRuns.$inferInsert;
+export type ForwardOosValidation = typeof forwardOosValidations.$inferSelect;
+export type NewForwardOosValidation = typeof forwardOosValidations.$inferInsert;
 export type BacktestRun = typeof backtestRuns.$inferSelect;
 export type NewBacktestRun = typeof backtestRuns.$inferInsert;

@@ -25,6 +25,7 @@ import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   dailySnapshots,
+  forwardOosValidations,
   marketCatalysts,
   markets,
   positions as positionsTable,
@@ -45,7 +46,7 @@ import {
 } from "@/lib/strategy";
 import { classifyMany, lookupStaticLabel } from "@/lib/classify";
 import { recordCronRun } from "@/lib/cron-tracker";
-import { evaluateBet } from "@/lib/llm-evaluator";
+import { evaluateBet, coldStartDampFactor } from "@/lib/llm-evaluator";
 
 export const runtime = "nodejs";
 export const maxDuration = 300; // 5 minutes
@@ -76,7 +77,47 @@ function isAuthorized(req: Request): boolean {
 }
 
 async function loadActiveStrategies(): Promise<Strategy[]> {
-  return db.select().from(strategies).where(eq(strategies.status, "active"));
+  const all = await db
+    .select()
+    .from(strategies)
+    .where(eq(strategies.status, "active"));
+
+  // Process fix #1 (2026-05-01): forward-OOS validation gate. Strategies
+  // with `requires_oos_validation=true` in their params (set by post-2026-05-01
+  // strategies as a hard deploy gate) are skipped if no validation row exists
+  // within the last 14 days. Existing strategies (baseline_v1, etc.) are
+  // grandfathered without this flag and continue normally.
+  //
+  // Prevents another v12 process error: I deployed v12 live before forward-OOS
+  // validation finished. With this gate, that's not possible anymore — the
+  // strategy is silently skipped until its validation row exists.
+  const cutoffMs = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  const cutoff = new Date(cutoffMs);
+  const filtered: Strategy[] = [];
+  for (const s of all) {
+    const params = (s.paramsJson ?? {}) as Record<string, unknown>;
+    if (params.requires_oos_validation === true) {
+      const recent = await db
+        .select({ id: forwardOosValidations.id })
+        .from(forwardOosValidations)
+        .where(
+          and(
+            eq(forwardOosValidations.strategyId, s.id),
+            sql`validated_at >= ${cutoff}`,
+            eq(forwardOosValidations.overallVerdict, "DEPLOY"),
+          ),
+        )
+        .limit(1);
+      if (recent.length === 0) {
+        console.warn(
+          `[cron] strategy ${s.id} requires_oos_validation=true but no DEPLOY-verdict validation in last 14d; skipping`,
+        );
+        continue;
+      }
+    }
+    filtered.push(s);
+  }
+  return filtered;
 }
 
 async function settleResolvedOpenPositions(args: {
@@ -352,9 +393,18 @@ async function processStrategyTrade(args: {
           marketRunningVolumeUsdc: marketRunningVolumeUsdc,
         });
         if (evalResult) {
-          stakeMultiplier = evalResult.stakeMultiplier;
+          // Process-fix #2 (2026-05-01): cold-start Kelly cap damps the
+          // multiplier in the strategy's first 30 days. Prevents another
+          // v12-style "in-sample lift looked great, OOS catastrophic" near-miss
+          // — even if the LLM emits a 2.0× confident multiplier, we can't go
+          // above 1.0× for 30 days. After 30 days of live data, full Kelly.
+          const damp = coldStartDampFactor(state.strategy.createdAt ?? null);
+          stakeMultiplier = evalResult.stakeMultiplier * damp;
           llmDecision = evalResult.decision;
-          llmRationale = evalResult.rationale;
+          llmRationale =
+            damp < 1.0
+              ? `[cold-start-damp ${damp}x] ${evalResult.rationale}`
+              : evalResult.rationale;
         }
       } catch (e) {
         // Don't block the cron on LLM errors — log + flat-stake fallback.

@@ -108,6 +108,49 @@ const SKIP_EDGE_THRESHOLD = 0.01;
 // staking (1.0×) instead of letting Kelly over-react to a low-information
 // estimate. Only relevant if the LLM emits very low confidence values.
 const MIN_CONFIDENCE_FOR_KELLY = 0.20;
+// Process-fix #2 (2026-05-01): cold-start Kelly cap. A strategy in its first
+// 30 days post-creation (per strategies.created_at) has its Kelly multiplier
+// damped by this factor regardless of in-sample headline. Prevents the v12
+// failure mode: in-sample +47.9% lift on N=247 calibration tempted shipping
+// at full Kelly; would have over-staked OOS bets that turned into systematic
+// losers. The damp factor is 0.5 (mentor's recommendation; my initial 0.25
+// would have killed the validation signal).
+const COLD_START_KELLY_DAMP = 0.5;
+const COLD_START_DAYS = 30;
+
+// Process-fix #3 (2026-05-01): calibration training set MIN size. v12's
+// failure was isotonic calibration overfit on N=247. Any future calibrator
+// loaded into this module must report training-set size; if below the
+// minimum, throw at load-time so the broken calibrator can't go live.
+//
+// Phase-1 v12 used RAW probability (no calibration in TS), so this constant
+// is a guard for Phase-2 when we port a calibration table. Document here
+// so the floor is permanent and can't be silently relaxed.
+export const MIN_CALIBRATION_TRAINING_SIZE = 1000;
+
+/**
+ * Validate a calibration table on load. Throws if training-set size is
+ * below MIN_CALIBRATION_TRAINING_SIZE. Call this in the calibration loader.
+ */
+export function assertCalibrationSize(trainingSize: number, label: string): void {
+  if (trainingSize < MIN_CALIBRATION_TRAINING_SIZE) {
+    throw new Error(
+      `[llm-evaluator] calibration ${label} training-set size ${trainingSize} < ${MIN_CALIBRATION_TRAINING_SIZE} (process-fix #3). v12's failure was isotonic overfit on N=247; this floor prevents repeating it.`,
+    );
+  }
+}
+
+/**
+ * Compute the cold-start damp factor for a strategy. Returns 1.0 (no damp)
+ * if the strategy was created more than COLD_START_DAYS ago.
+ */
+export function coldStartDampFactor(strategyCreatedAt: Date | null): number {
+  if (!strategyCreatedAt) return 1.0;
+  const ageMs = Date.now() - strategyCreatedAt.getTime();
+  const cutoffMs = COLD_START_DAYS * 24 * 60 * 60 * 1000;
+  if (ageMs > cutoffMs) return 1.0;
+  return COLD_START_KELLY_DAMP;
+}
 
 /**
  * Run the v12 evaluator on a single bet candidate. Returns the calibrated
