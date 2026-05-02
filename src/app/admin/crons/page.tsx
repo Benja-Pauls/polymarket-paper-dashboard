@@ -13,7 +13,7 @@
 
 import { desc, eq, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { cronRuns } from "@/lib/db/schema";
+import { cronRuns, type CronRun } from "@/lib/db/schema";
 import { fmtCST, fmtAgo, fmtCountdown, nextCronFire } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -56,15 +56,12 @@ const CRONS: CronDef[] = [
   },
 ];
 
-type LastRunRow = {
-  cron_name: string;
-  started_at: Date;
-  finished_at: Date;
-  duration_ms: number;
-  status: string;
-  result_json: Record<string, unknown> | null;
-  error_message: string | null;
-};
+// Use Drizzle's inferred type — fields are camelCase (cronName, startedAt,
+// finishedAt, durationMs, errorMessage). Earlier the page used a snake_case
+// LastRunRow type cast via `as unknown as LastRunRow`, which silently broke
+// the timestamp/duration display ("Last run started: —", "Duration: NaNs")
+// because every field access was undefined.
+type LastRunRow = CronRun;
 
 export default async function CronsPage() {
   const nowMs = Date.now();
@@ -80,8 +77,8 @@ export default async function CronsPage() {
       .orderBy(desc(cronRuns.startedAt))
       .limit(10);
     if (recent.length > 0) {
-      lastByName.set(c.name, recent[0] as unknown as LastRunRow);
-      recentByName.set(c.name, recent as unknown as LastRunRow[]);
+      lastByName.set(c.name, recent[0]);
+      recentByName.set(c.name, recent);
     }
   }
 
@@ -169,13 +166,13 @@ export default async function CronsPage() {
                 {last ? (
                   <div className="space-y-2 text-sm">
                     <Row k="Started">
-                      {fmtCST(last.started_at)} — {fmtAgo(last.started_at, nowMs)}
+                      {fmtCST(last.startedAt)} — {fmtAgo(last.startedAt, nowMs)}
                     </Row>
                     <Row k="Finished">
-                      {fmtCST(last.finished_at)}
+                      {fmtCST(last.finishedAt)}
                     </Row>
                     <Row k="Duration">
-                      {(last.duration_ms / 1000).toFixed(1)}s
+                      {(last.durationMs / 1000).toFixed(1)}s
                     </Row>
                     <Row k="Status">
                       <span
@@ -188,20 +185,20 @@ export default async function CronsPage() {
                         {last.status.toUpperCase()}
                       </span>
                     </Row>
-                    {last.error_message ? (
+                    {last.errorMessage ? (
                       <Row k="Error">
-                        <code className="text-xs text-red-600">
-                          {last.error_message}
+                        <code className="text-xs text-red-600 break-all whitespace-pre-wrap">
+                          {last.errorMessage}
                         </code>
                       </Row>
                     ) : null}
-                    {last.result_json ? (
+                    {last.resultJson ? (
                       <details className="pt-2">
                         <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground">
                           Result JSON
                         </summary>
                         <pre className="mt-2 text-xs bg-muted/40 p-3 rounded overflow-x-auto">
-                          {JSON.stringify(last.result_json, null, 2)}
+                          {JSON.stringify(last.resultJson, null, 2)}
                         </pre>
                       </details>
                     ) : null}
@@ -232,7 +229,7 @@ export default async function CronsPage() {
                   <tbody>
                     {recent.map((r, i) => (
                       <tr key={i} className="border-t">
-                        <Td>{fmtCST(r.started_at)}</Td>
+                        <Td>{fmtCST(r.startedAt)}</Td>
                         <Td>
                           <span
                             className={
@@ -244,8 +241,8 @@ export default async function CronsPage() {
                             {r.status}
                           </span>
                         </Td>
-                        <Td>{(r.duration_ms / 1000).toFixed(1)}s</Td>
-                        <Td className="font-mono">{summariseResult(r.result_json)}</Td>
+                        <Td>{(r.durationMs / 1000).toFixed(1)}s</Td>
+                        <Td className="font-mono">{summariseResult(r.resultJson)}</Td>
                       </tr>
                     ))}
                   </tbody>

@@ -13,7 +13,11 @@
 import { db } from "@/lib/db";
 import { cronRuns } from "@/lib/db/schema";
 
-const MAX_ERROR_MSG = 1000;
+// Drizzle's error message format is "Failed query: <SQL>\nparams: <values>\n<actual postgres error reason>".
+// At 1000 chars we never see the postgres reason — just truncated SQL. Bump to
+// 8000 so we capture the entire chain. Errors are rare enough that the row
+// size doesn't matter for the cron_runs table.
+const MAX_ERROR_MSG = 8000;
 
 /**
  * Wrap a cron handler's body. The wrapper:
