@@ -54,6 +54,14 @@ type SyncResult = {
   ok: boolean;
   gamma_reachable: boolean;
   open_markets_seen: number;
+  // Open-list rows after dedup-by-cid. Polymarket Gamma's paginated open-list
+  // is not stable across page boundaries (sort instability), so it commonly
+  // returns the same condition_id on consecutive pages. We must dedupe before
+  // any bulk INSERT...ON CONFLICT or Postgres rejects the whole batch with
+  // code 21000 ("ON CONFLICT DO UPDATE command cannot affect row a second
+  // time"). gamma_dupes_dropped > 0 confirms Gamma was returning dupes.
+  open_markets_unique: number;
+  gamma_dupes_dropped: number;
   matched_static_labels: number;
   classified_via_llm: number;
   classified_skipped_budget: number;
@@ -77,6 +85,8 @@ async function runOnce(opts: {
     ok: true,
     gamma_reachable: true,
     open_markets_seen: 0,
+    open_markets_unique: 0,
+    gamma_dupes_dropped: 0,
     matched_static_labels: 0,
     classified_via_llm: 0,
     classified_skipped_budget: 0,
@@ -108,6 +118,36 @@ async function runOnce(opts: {
     throw e;
   }
   result.open_markets_seen = openList.length;
+
+  // Dedupe openList by condition_id. Gamma's paginated `?closed=false&active=true`
+  // is not order-stable: under load (or when markets close mid-pagination) the
+  // same condition_id can appear on multiple pages and end up in our list twice.
+  // Postgres' INSERT ... ON CONFLICT DO UPDATE rejects same-row dupes within
+  // one statement with SQLSTATE 21000 ("cannot affect row a second time"),
+  // failing the whole batch — which is exactly the failure we observed across
+  // all hourly sync-open-markets runs from 2026-05-02 12:00 onward (10/22
+  // failures in 24h). Last-write-wins on cid; we prefer the more-recently-paged
+  // entry (slightly more likely to have a fresh endDate).
+  const seenCids = new Set<string>();
+  const dedupedOpenList: GammaMarket[] = [];
+  // Iterate in reverse so the LAST occurrence of a cid wins, then re-reverse.
+  for (let i = openList.length - 1; i >= 0; i--) {
+    const m = openList[i];
+    const cid = m.conditionId.toLowerCase();
+    if (seenCids.has(cid)) continue;
+    seenCids.add(cid);
+    dedupedOpenList.push(m);
+  }
+  dedupedOpenList.reverse();
+  result.gamma_dupes_dropped = openList.length - dedupedOpenList.length;
+  result.open_markets_unique = dedupedOpenList.length;
+  if (result.gamma_dupes_dropped > 0) {
+    console.warn(
+      `[sync-open-markets] gamma returned ${openList.length} rows but only ${dedupedOpenList.length} unique cids (dropped ${result.gamma_dupes_dropped} dupes)`,
+    );
+  }
+  openList = dedupedOpenList;
+
   console.log(`[sync-open-markets] gamma: ${openList.length} open markets`);
 
   // Step 2a: pre-load existing DB categories so we skip LLM for any cid we
@@ -227,9 +267,23 @@ async function runOnce(opts: {
   // Step 5: bulk upsert. Important: we DON'T overwrite category if it was
   // already set in the DB by an earlier classification (avoid flipping back to
   // null when an LLM call returned null) — the COALESCE in `set` does this.
+  //
+  // Belt-and-braces dedupe at the upserts level: openList was already deduped
+  // above, so this is a defense-in-depth check. If any future code path adds
+  // a cid to upserts twice, we'd hit Postgres 21000 again. Dedupe last-write-
+  // wins by cid; track if anything is actually dropped here (it shouldn't be).
+  const dedupedUpserts = new Map<string, Upsert>();
+  for (const u of upserts) dedupedUpserts.set(u.cid, u);
+  if (dedupedUpserts.size !== upserts.length) {
+    console.warn(
+      `[sync-open-markets] post-bucket dedupe dropped ${upserts.length - dedupedUpserts.size} (this means a NEW dupe path slipped through — investigate)`,
+    );
+  }
+  const finalUpserts = Array.from(dedupedUpserts.values());
+
   const BATCH = 200;
-  for (let i = 0; i < upserts.length; i += BATCH) {
-    const slice = upserts.slice(i, i + BATCH);
+  for (let i = 0; i < finalUpserts.length; i += BATCH) {
+    const slice = finalUpserts.slice(i, i + BATCH);
     if (slice.length === 0) continue;
     await db
       .insert(markets)
@@ -256,7 +310,7 @@ async function runOnce(opts: {
         },
       });
   }
-  result.upserted = upserts.length;
+  result.upserted = finalUpserts.length;
 
   // Step 6: STALE-MARK pass — tradeable_* markets in our DB that did NOT
   // appear in this open-list pagination are almost certainly CLOSED on Gamma

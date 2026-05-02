@@ -307,6 +307,8 @@ function summariseResult(r: Record<string, unknown> | null): string {
     "duplicates_skipped",
     "positions_settled",
     "open_markets_seen",
+    "open_markets_unique",
+    "gamma_dupes_dropped",
     "matched_static_labels",
     "classified_via_llm",
     "upserted",
