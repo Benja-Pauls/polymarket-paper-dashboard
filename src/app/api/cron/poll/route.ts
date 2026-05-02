@@ -45,6 +45,7 @@ import {
 } from "@/lib/strategy";
 import { classifyMany, lookupStaticLabel } from "@/lib/classify";
 import { recordCronRun } from "@/lib/cron-tracker";
+import { evaluateBet } from "@/lib/llm-evaluator";
 
 export const runtime = "nodejs";
 export const maxDuration = 300; // 5 minutes
@@ -329,6 +330,59 @@ async function processStrategyTrade(args: {
   }
 
   if (decision.action === "bet" && signalId != null) {
+    // v12 LLM-evaluator hook: when the strategy opts in, run a Haiku
+    // probability estimate on this candidate bet and adjust the stake by
+    // the Kelly fraction. Falls back to flat staking on any error so the
+    // live cron never gets stuck on an LLM outage.
+    let stakeMultiplier = 1.0;
+    let llmDecision: "bet" | "skip" = "bet";
+    let llmRationale: string | null = null;
+    if (state.params.llm_evaluator_enabled === true) {
+      try {
+        const hoursToRes =
+          marketResolutionTs != null
+            ? (marketResolutionTs - trade.timestamp) / 3600
+            : 24 * 30;
+        const evalResult = await evaluateBet({
+          question: marketQuestionText ?? "(unknown)",
+          category: marketCategory,
+          entryPrice: decision.entryPrice ?? trade.price,
+          betOutcome: (decision.betOutcome ?? trade.outcomeIdx) as 0 | 1,
+          hoursToResolution: hoursToRes,
+          marketRunningVolumeUsdc: marketRunningVolumeUsdc,
+        });
+        if (evalResult) {
+          stakeMultiplier = evalResult.stakeMultiplier;
+          llmDecision = evalResult.decision;
+          llmRationale = evalResult.rationale;
+        }
+      } catch (e) {
+        // Don't block the cron on LLM errors — log + flat-stake fallback.
+        console.warn(
+          `[v12 evaluator] error on ${trade.conditionId.slice(0, 8)}:`,
+          (e as Error).message,
+        );
+      }
+    }
+
+    if (llmDecision === "skip") {
+      state.nSkipped += 1;
+      // Update the signal's reason so the dashboard shows the LLM rationale.
+      try {
+        await db
+          .update(signalsTable)
+          .set({
+            decision: "skip",
+            reason: `llm-evaluator skip: ${llmRationale ?? "negative edge"}`,
+          })
+          .where(eq(signalsTable.id, signalId));
+      } catch {
+        // Non-fatal; the original "bet" decision was already recorded.
+      }
+      return;
+    }
+
+    const adjustedStake = state.strategy.stake * stakeMultiplier;
     await db.insert(positionsTable).values({
       strategyId: state.strategy.id,
       signalId,
@@ -336,7 +390,7 @@ async function processStrategyTrade(args: {
       side: trade.side,
       entryPrice: decision.entryPrice,
       betOutcome: decision.betOutcome,
-      stake: state.strategy.stake,
+      stake: adjustedStake,
       entryTs: trade.timestamp,
       plannedResolutionTs: marketResolutionTs,
     });
@@ -352,12 +406,12 @@ async function processStrategyTrade(args: {
     await db
       .update(strategies)
       .set({
-        currentCash: sql`${strategies.currentCash} - ${state.strategy.stake}`,
+        currentCash: sql`${strategies.currentCash} - ${adjustedStake}`,
         updatedAt: new Date(),
       })
       .where(eq(strategies.id, state.strategy.id));
-    state.cash -= state.strategy.stake;
-    state.cashSpent += state.strategy.stake;
+    state.cash -= adjustedStake;
+    state.cashSpent += adjustedStake;
     state.nBetsAdded += 1;
     state.betCountByMarket.set(
       trade.conditionId,

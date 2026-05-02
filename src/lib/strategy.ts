@@ -138,6 +138,20 @@ export type StrategyParams = {
    * strategies pre-Wave-11). v11_best_combined opts into 48h.
    */
   min_market_lifespan_hours?: number | null;
+  /**
+   * v12 LLM-evaluator opt-in (2026-05-01). When true, after the standard
+   * cap-N + ep filter says BET, the cron handler calls Haiku 4.5 to estimate
+   * the bet's TRUE probability. Stake is then adjusted by the Kelly fraction
+   * (capped 0.5×–2.0×). Negative-edge bets are SKIPPED rather than placed at
+   * minimum stake.
+   *
+   * Source: results/llm_evaluator_strong_form.md. Haiku tier delivered
+   * +47.9% Kelly P&L lift on a 247-bet sample. Bigger models (Sonnet/Opus)
+   * performed WORSE due to overconfident outputs Kelly over-stakes on.
+   * Phase-1 MVP uses raw probability (no isotonic calibration in TS yet);
+   * Phase-2 will add calibration after 100+ live bets accumulate.
+   */
+  llm_evaluator_enabled?: boolean;
 };
 
 /**
