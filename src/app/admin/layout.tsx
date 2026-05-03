@@ -10,6 +10,7 @@ export const metadata = {
 const ADMIN_LINKS = [
   { href: "/admin/crons", label: "Crons" },
   { href: "/admin/edge-rate", label: "Edge Rate" },
+  { href: "/admin/llm-cost", label: "LLM Cost" },
 ];
 
 export default function AdminLayout({

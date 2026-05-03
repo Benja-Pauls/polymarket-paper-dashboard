@@ -517,6 +517,12 @@ async function runOnce(): Promise<{
   duplicates_skipped: number;
   positions_settled: number;
   cash_settled_in: number;
+  // LLM-cost rollup fields. classified-via-Haiku numbers are aggregated by
+  // /admin/llm-cost (sum across recent cron_runs.result_json) so we can see
+  // monthly spend at a glance without instrumenting Anthropic billing.
+  lazy_llm_calls_attempted: number;
+  lazy_llm_calls_completed: number;
+  lazy_llm_cost_usd: number;
   per_strategy: Array<{
     id: string;
     bets: number;
@@ -538,6 +544,9 @@ async function runOnce(): Promise<{
       duplicates_skipped: 0,
       positions_settled: 0,
       cash_settled_in: 0,
+      lazy_llm_calls_attempted: 0,
+      lazy_llm_calls_completed: 0,
+      lazy_llm_cost_usd: 0,
       per_strategy: [],
     };
   }
@@ -733,7 +742,13 @@ async function runOnce(): Promise<{
   console.log(
     `[cron] lazy-classify: ${lazyResolutions.size - llmInput.length} from static labels, ${llmInput.length} need LLM (out of ${cidsNeedingCategory.size} total need-category)`,
   );
+  // Stats for the result_json LLM-cost rollup. The /admin/llm-cost page
+  // sums these across recent cron runs to show total spend.
+  let lazyLlmCallsAttempted = 0;
+  let lazyLlmCallsCompleted = 0;
+  let lazyLlmCostUsd = 0;
   if (llmInput.length > 0 && process.env.ANTHROPIC_API_KEY) {
+    lazyLlmCallsAttempted = llmInput.length;
     try {
       const llmOut = await classifyMany({
         items: llmInput,
@@ -741,6 +756,11 @@ async function runOnce(): Promise<{
         // Lower budget per poll (we run every 15 min) than per sync (every 6h).
         budgetUsd: 1,
       });
+      lazyLlmCallsCompleted = llmOut.size;
+      // Same per-call cost the classifier itself uses internally
+      // (src/lib/classify/index.ts COST_PER_CALL = $0.0002). Kept in sync
+      // here so the cost dashboard shows real numbers without a DB hop.
+      lazyLlmCostUsd = Number((llmOut.size * 0.0002).toFixed(4));
       for (const [cid, cat] of llmOut.entries()) {
         const prev = lazyResolutions.get(cid) ?? {
           category: null,
@@ -972,6 +992,9 @@ async function runOnce(): Promise<{
     duplicates_skipped: totalDup,
     positions_settled: totalSettled,
     cash_settled_in: totalSettleCash,
+    lazy_llm_calls_attempted: lazyLlmCallsAttempted,
+    lazy_llm_calls_completed: lazyLlmCallsCompleted,
+    lazy_llm_cost_usd: lazyLlmCostUsd,
     per_strategy: perStrategySummary,
   };
 }
