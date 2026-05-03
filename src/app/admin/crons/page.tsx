@@ -52,7 +52,7 @@ const CRONS: CronDef[] = [
     schedule: "0 */4 * * *",
     schedule_human: "every 4 hours",
     description:
-      "Deletes skip signals older than 24h to keep the DB under Neon's 512 MB cap. Without it the signals table grows ~1.5M rows/day (10+ strategies × 1500 trades × 96 polls). Bet signals (FK-referenced by positions) are never deleted. Bumped from daily to 4-hourly on 2026-05-01 after re-hitting the cap; daily wasn't enough at the current strategy count. Plain VACUUM after delete; explicit VACUUM FULL reserved for manual operator action.",
+      "Deletes skip signals older than 24h. Defense-in-depth: as of 2026-05-03 the poll cron no longer writes skip signals to DB by default (LOG_SKIP_SIGNALS_TO_DB=false; they go to Vercel runtime logs as `[skip] strategy=… cid=… reason=…` lines). This cron stays scheduled to drain any historical skip rows and to keep things tidy if an operator flips the env flag back on for forensics. Bet signals (FK-referenced by positions, aggregated by /admin/edge-rate) are never deleted. Plain VACUUM after delete; explicit VACUUM FULL reserved for manual operator action.",
   },
 ];
 

@@ -54,6 +54,23 @@ export const dynamic = "force-dynamic";
 
 const NOW_S = () => Math.floor(Date.now() / 1000);
 
+// Skip-signal log policy.
+//
+// 2026-05-03: hit Neon's 512 MB project cap. The `signals` table was 461 MB
+// (94% of the DB), 685K rows, of which only 654 were `decision='bet'` (the
+// rows we actually use — positions FK them, edge-rate dashboard aggregates
+// them). The other 99.9% were skip-decision rows that we never read
+// programmatically; they were intended as debug breadcrumbs but the volume
+// (~30K/hour) was overwhelming the prune-signals cron's 24h retention.
+//
+// The fix: by default, do NOT INSERT skip signals to DB — emit a structured
+// console log line instead. Vercel runtime logs retain the same info for
+// ad-hoc debugging (greppable: `[skip] strategy=... cid=... reason=...`).
+//
+// To re-enable DB writes for skip signals (e.g. for one-off forensics),
+// set LOG_SKIP_SIGNALS_TO_DB=true in Vercel env vars.
+const LOG_SKIP_SIGNALS_TO_DB = process.env.LOG_SKIP_SIGNALS_TO_DB === "true";
+
 type MarketCacheEntry = {
   conditionId: string;
   category: string | null;
@@ -340,8 +357,26 @@ async function processStrategyTrade(args: {
     params: state.params,
   });
 
-  // Insert signal (idempotent on (strategyId, rawTradeId))
+  // Skip path: by default, log + return without touching DB. See the
+  // LOG_SKIP_SIGNALS_TO_DB note at the top of the file for why.
+  // Bet path: insert as before — bet signals are FK-referenced by positions
+  // and aggregated by /admin/edge-rate, so they MUST persist.
   let signalId: number | null = null;
+  if (decision.action === "skip" && !LOG_SKIP_SIGNALS_TO_DB) {
+    // Structured single-line log so ad-hoc grep-in-Vercel-logs still works.
+    // Truncate the reason aggressively — at ~30K skips/hour, full reasons
+    // would balloon log volume. Operators can re-enable DB writes via the
+    // env flag if they need full forensics for a specific strategy.
+    console.log(
+      `[skip] strategy=${state.strategy.id} cid=${trade.conditionId.slice(0, 10)} reason=${decision.reason.slice(0, 80)}`,
+    );
+    state.nSkipped += 1;
+    return;
+  }
+
+  // Insert signal (idempotent on (strategyId, rawTradeId)).
+  // Reaches here only for `decision.action === "bet"` OR when
+  // LOG_SKIP_SIGNALS_TO_DB is on.
   try {
     const ins = await db
       .insert(signalsTable)
