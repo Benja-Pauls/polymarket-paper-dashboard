@@ -48,6 +48,18 @@ export const markets = pgTable("markets", {
    * counts trades since the cron started polling.
    */
   runningVolumeUsdc: doublePrecision("running_volume_usdc").notNull().default(0),
+  /**
+   * Latest YES-side price from Gamma's `outcomePrices` (index 0). NO-side price
+   * is implicitly `1 - current_yes_price`. Updated by sync-open-markets every
+   * hour for ALL open markets, and (faster cadence) by refresh-position-prices
+   * for the subset of markets where any strategy has an open position. Used
+   * for mark-to-market unrealized P&L on open positions — without it the
+   * dashboard's cost-basis P&L view freezes at the entry price for the entire
+   * resolution window (which can be 30+ days), making early-bet performance
+   * invisible.
+   */
+  currentYesPrice: doublePrecision("current_yes_price"),
+  priceUpdatedAt: timestamp("price_updated_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });

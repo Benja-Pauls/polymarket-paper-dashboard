@@ -271,6 +271,20 @@ function StrategyCard({
               <p className={`text-2xl font-semibold ${pnlClass}`}>
                 {fmtUsdSigned(sum.cumulativePnl)}
               </p>
+              {/* Realized + unrealized split. Headline is MTM (real+unreal);
+                  this breakdown reassures operators when the headline moves
+                  but no positions have actually settled yet. */}
+              {(sum.realizedPnl !== 0 || sum.unrealizedPnl !== 0) ? (
+                <p className="mt-1 text-[10px] font-mono text-muted-foreground">
+                  <span className={sum.realizedPnl > 0 ? "text-emerald-400/70" : sum.realizedPnl < 0 ? "text-red-400/70" : ""}>
+                    real {fmtUsdSigned(sum.realizedPnl)}
+                  </span>
+                  <span className="mx-1">·</span>
+                  <span className={sum.unrealizedPnl > 0 ? "text-emerald-400/70" : sum.unrealizedPnl < 0 ? "text-red-400/70" : ""}>
+                    unreal {fmtUsdSigned(sum.unrealizedPnl)}
+                  </span>
+                </p>
+              ) : null}
             </div>
             <div className="text-right">
               <p className="text-xs uppercase tracking-wider text-muted-foreground">
@@ -283,6 +297,14 @@ function StrategyCard({
               {sum.nOpen > 0 ? (
                 <p className="font-mono text-[11px] text-amber-500/80 mt-0.5">
                   {fmtUsd(sum.totalOpenStake)} in {sum.nOpen} open
+                </p>
+              ) : null}
+              {/* Coverage indicator — how many open positions actually have a
+                  fresh price vs. fall back to cost-basis. Helps operators see
+                  if the price-refresh cron is keeping up. Hidden when 100%. */}
+              {sum.nOpen > 0 && sum.nOpenWithPrice < sum.nOpen ? (
+                <p className="font-mono text-[10px] text-muted-foreground/70 mt-0.5">
+                  {sum.nOpenWithPrice}/{sum.nOpen} priced
                 </p>
               ) : null}
             </div>

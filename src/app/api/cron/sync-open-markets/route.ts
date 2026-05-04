@@ -53,6 +53,12 @@ function isAuthorized(req: Request): boolean {
 type SyncResult = {
   ok: boolean;
   gamma_reachable: boolean;
+  // Number of upserts where we wrote a current_yes_price (i.e. Gamma's
+  // outcomePrices field parsed into a valid [0,1] number). Tracked so the
+  // /admin/crons dashboard can surface "did the MTM pipeline actually
+  // refresh prices this run?" — most open markets have prices, so this
+  // should be ≥95% of upserted on a healthy run.
+  prices_updated: number;
   open_markets_seen: number;
   // Open-list rows after dedup-by-cid. Polymarket Gamma's paginated open-list
   // is not stable across page boundaries (sort instability), so it commonly
@@ -84,6 +90,7 @@ async function runOnce(opts: {
   const result: SyncResult = {
     ok: true,
     gamma_reachable: true,
+    prices_updated: 0,
     open_markets_seen: 0,
     open_markets_unique: 0,
     gamma_dupes_dropped: 0,
@@ -173,6 +180,7 @@ async function runOnce(opts: {
     cid: string;
     question: string | null;
     endTs: number | null;
+    yesPrice: number | null; // Latest YES price from Gamma's outcomePrices (for MTM)
   };
   // Markets with a known category (static or DB) — we still upsert them (so
   // res_ts gets refreshed) but DON'T pay LLM cost. category=null is fine here
@@ -183,14 +191,15 @@ async function runOnce(opts: {
   for (const m of openList) {
     const endTs = parseEndTs(m.endDate);
     const cid = m.conditionId.toLowerCase();
+    const yesPrice = m.currentYesPrice;
     const staticCat = lookupStaticLabel(cid);
     if (staticCat) {
-      labelled.push({ cid, question: m.question, endTs, category: staticCat });
+      labelled.push({ cid, question: m.question, endTs, yesPrice, category: staticCat });
     } else if (dbCidSet.has(cid)) {
       // Already classified in DB; pass category=null and let COALESCE preserve it.
-      labelled.push({ cid, question: m.question, endTs, category: null });
+      labelled.push({ cid, question: m.question, endTs, yesPrice, category: null });
     } else if ((m.question ?? "").trim()) {
-      needsLlm.push({ cid, question: m.question, endTs });
+      needsLlm.push({ cid, question: m.question, endTs, yesPrice });
     }
     // markets with no question text + no static label + no DB row are dropped
   }
@@ -240,6 +249,7 @@ async function runOnce(opts: {
     question: string | null;
     endTs: number | null;
     category: string | null;
+    yesPrice: number | null;
   };
   const upserts: Upsert[] = [];
   for (const r of labelled) {
@@ -248,6 +258,7 @@ async function runOnce(opts: {
       question: r.question,
       endTs: r.endTs,
       category: r.category,
+      yesPrice: r.yesPrice,
     });
   }
   // Include all needsLlm cids (even those deferred past MAX_LLM_CALLS_PER_RUN)
@@ -261,6 +272,7 @@ async function runOnce(opts: {
       question: p.question,
       endTs: p.endTs,
       category: cat,
+      yesPrice: p.yesPrice,
     });
   }
 
@@ -282,9 +294,14 @@ async function runOnce(opts: {
   const finalUpserts = Array.from(dedupedUpserts.values());
 
   const BATCH = 200;
+  // Used as both the run's "now" stamp for price freshness AND for updated_at;
+  // single Date object so all rows in this batch agree on a price-update time.
+  const upsertNow = new Date();
+  let priceUpdatedCount = 0;
   for (let i = 0; i < finalUpserts.length; i += BATCH) {
     const slice = finalUpserts.slice(i, i + BATCH);
     if (slice.length === 0) continue;
+    for (const r of slice) if (r.yesPrice != null) priceUpdatedCount++;
     await db
       .insert(markets)
       .values(
@@ -293,6 +310,11 @@ async function runOnce(opts: {
           questionText: r.question,
           category: r.category,
           resolutionTimestamp: r.endTs,
+          // First-seen markets get the price we just observed; if we never
+          // saw a price (gamma omitted the field), leave currentYesPrice as
+          // NULL and the dashboard renders "—" for unrealized P&L.
+          currentYesPrice: r.yesPrice,
+          priceUpdatedAt: r.yesPrice != null ? upsertNow : null,
         })),
       )
       .onConflictDoUpdate({
@@ -306,11 +328,18 @@ async function runOnce(opts: {
           // Only set resolution_timestamp if previous was NULL or in the past.
           // This prevents Gamma drift from corrupting a confirmed settled ts.
           resolutionTimestamp: sql`coalesce(${markets.resolutionTimestamp}, excluded.resolution_timestamp)`,
-          updatedAt: new Date(),
+          // Always replace YES price + timestamp when Gamma gave us a value
+          // — this is the live-MTM whole point. coalesce against the new
+          // value so a NULL result from Gamma (rare on actively-traded
+          // markets) does NOT erase a prior valid price.
+          currentYesPrice: sql`coalesce(excluded.current_yes_price, ${markets.currentYesPrice})`,
+          priceUpdatedAt: sql`coalesce(excluded.price_updated_at, ${markets.priceUpdatedAt})`,
+          updatedAt: upsertNow,
         },
       });
   }
   result.upserted = finalUpserts.length;
+  result.prices_updated = priceUpdatedCount;
 
   // Step 6: STALE-MARK pass — tradeable_* markets in our DB that did NOT
   // appear in this open-list pagination are almost certainly CLOSED on Gamma

@@ -50,6 +50,13 @@
       "when": 1777738941240,
       "tag": "0006_bizarre_sharon_ventura",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1777912487517,
+      "tag": "0007_past_leper_queen",
+      "breakpoints": true
     }
   ]
 }

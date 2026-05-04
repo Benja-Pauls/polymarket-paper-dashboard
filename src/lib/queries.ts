@@ -22,13 +22,39 @@ import { computeTripwireStatus, type TripwireStatus } from "./strategy";
 export type StrategySummary = {
   strategy: Strategy;
   cashCurrent: number;
+  /**
+   * Realized + unrealized P&L. The unrealized portion comes from MTM-ing
+   * each open position against the latest current_yes_price on its market
+   * (refreshed every 5 min by the refresh-position-prices cron). This is
+   * what the dashboard headlines — gives ongoing signal without waiting
+   * 30+ days for resolution.
+   */
   cumulativePnl: number;
+  /** Settled positions only: payout - stake summed across all closed bets. */
   realizedPnl: number;
+  /**
+   * Open positions valued at current_yes_price (or 1 - yes_price for NO bets)
+   * minus their stake. Positive = bets are winning so far at market;
+   * negative = bets are losing at market. Positions on markets where we
+   * don't have a price yet contribute 0 (treated as cost-basis), so this
+   * is a lower bound on signal — when the next price-refresh cron fires,
+   * the true number replaces it.
+   */
+  unrealizedPnl: number;
+  /**
+   * Open positions at cost-basis (sum of stakes). Old metric, kept because
+   * the home-page card shows "$X locked in N open" — those numbers should
+   * still be cost-basis to communicate "this is what we have at risk."
+   */
+  totalOpenStake: number;
+  /** Open positions at MTM (current value, not cost basis). */
+  totalOpenMtm: number;
+  /** Number of open positions where we have a fresh price (not cost-basis). */
+  nOpenWithPrice: number;
   nOpen: number;
   nClosed: number;
   nBetsTotal: number;
   hitRate: number | null; // wins / closed
-  totalOpenStake: number;
   sparkline: { date: string; cumulativePnl: number }[]; // last 7
 };
 
@@ -49,9 +75,18 @@ export async function getStrategy(id: string): Promise<Strategy | null> {
 }
 
 export async function getStrategySummary(s: Strategy): Promise<StrategySummary> {
+  // Pull open positions JOINED to markets so we can MTM them against the
+  // latest current_yes_price. Positions on markets we never priced will
+  // have currentYesPrice=null and fall back to cost-basis.
   const openRows = await db
-    .select({ stake: positionsTable.stake })
+    .select({
+      stake: positionsTable.stake,
+      entryPrice: positionsTable.entryPrice,
+      betOutcome: positionsTable.betOutcome,
+      currentYesPrice: markets.currentYesPrice,
+    })
     .from(positionsTable)
+    .leftJoin(markets, eq(positionsTable.marketCid, markets.conditionId))
     .where(and(eq(positionsTable.strategyId, s.id), isNull(positionsTable.settledTs)));
 
   const closedRows = await db
@@ -69,14 +104,45 @@ export async function getStrategySummary(s: Strategy): Promise<StrategySummary> 
     .where(and(eq(signalsTable.strategyId, s.id), eq(signalsTable.decision, "bet")));
 
   const nOpen = openRows.length;
-  const totalOpenStake = openRows.reduce((acc, r) => acc + Number(r.stake), 0);
+  let totalOpenStake = 0;
+  let totalOpenMtm = 0;
+  let nOpenWithPrice = 0;
+  let unrealizedPnl = 0;
+  for (const r of openRows) {
+    const stake = Number(r.stake);
+    totalOpenStake += stake;
+    const entryPrice = Number(r.entryPrice);
+    const yesPrice = r.currentYesPrice;
+    // Mark-to-market a binary bet: shares = stake / entry_price, then value
+    // those shares at the current price of the side we bought.
+    //   bet_outcome=0 (bought YES) -> current value = shares * yes_price
+    //   bet_outcome=1 (bought NO)  -> current value = shares * (1 - yes_price)
+    // If we don't have a fresh price for this market, treat at cost-basis
+    // (no unrealized contribution) — better to under-report than show a
+    // misleading positive based on stale data.
+    if (yesPrice == null || !Number.isFinite(entryPrice) || entryPrice <= 0) {
+      totalOpenMtm += stake;
+      continue;
+    }
+    nOpenWithPrice += 1;
+    const shares = stake / entryPrice;
+    const sidePrice = r.betOutcome === 0 ? yesPrice : 1 - yesPrice;
+    const mtmValue = shares * sidePrice;
+    totalOpenMtm += mtmValue;
+    unrealizedPnl += mtmValue - stake;
+  }
+
   const nClosed = closedRows.length;
   const wins = closedRows.filter((r) => r.won === 1).length;
   const realizedPnl = closedRows.reduce(
     (acc, r) => acc + ((r.payout ?? 0) - Number(r.stake)),
     0,
   );
-  const cumulativePnl = Number(s.currentCash) + totalOpenStake - Number(s.startingBankroll);
+  // True P&L = realized (settled positions) + unrealized (MTM open positions).
+  // Equivalent to: currentCash + totalOpenMtm - startingBankroll, since
+  // currentCash already accounts for stakes that left the bankroll.
+  const cumulativePnl =
+    Number(s.currentCash) + totalOpenMtm - Number(s.startingBankroll);
 
   const snaps = await db
     .select()
@@ -97,11 +163,14 @@ export async function getStrategySummary(s: Strategy): Promise<StrategySummary> 
     cashCurrent: Number(s.currentCash),
     cumulativePnl,
     realizedPnl,
+    unrealizedPnl,
+    totalOpenStake,
+    totalOpenMtm,
+    nOpenWithPrice,
     nOpen,
     nClosed,
     nBetsTotal: nBetsResult[0]?.c ?? 0,
     hitRate: nClosed > 0 ? wins / nClosed : null,
-    totalOpenStake,
     sparkline,
   };
 }
@@ -129,10 +198,25 @@ export async function getWealthCurve(strategyId: string): Promise<WealthCurvePoi
   }));
 }
 
-export type OpenPositionRow = Position & {
+// Base shape — Position + the joined market metadata. Both Open and Closed
+// rows extend this; only Open carries MTM fields (closed positions resolve
+// to a definite payout, so unrealized is moot).
+type PositionWithMarket = Position & {
   question: string | null;
   category: string | null;
   resolutionTimestamp: number | null;
+};
+
+export type OpenPositionRow = PositionWithMarket & {
+  /** Latest YES price from Gamma. NO-side price = 1 - this. Null if never priced. */
+  currentYesPrice: number | null;
+  priceUpdatedAt: Date | null;
+  /** MTM value (current market value of the position in USDC). */
+  mtmValue: number | null;
+  /** mtmValue - stake; positive = winning at market, negative = losing. */
+  unrealizedPnl: number | null;
+  /** unrealizedPnl / stake; null when no price yet. */
+  unrealizedReturnPct: number | null;
 };
 
 export async function getOpenPositions(strategyId: string, limit = 200): Promise<OpenPositionRow[]> {
@@ -146,15 +230,46 @@ export async function getOpenPositions(strategyId: string, limit = 200): Promise
     .where(and(eq(positionsTable.strategyId, strategyId), isNull(positionsTable.settledTs)))
     .orderBy(desc(positionsTable.entryTs))
     .limit(limit);
-  return rows.map(({ position, market }) => ({
+  return rows.map(({ position, market }) => mapOpenPositionRow(position, market));
+}
+
+/**
+ * Mark-to-market a position against its market's latest YES price.
+ * Used by both getOpenPositions and getMarketDetail; centralized here so
+ * the MTM math is defined once.
+ */
+function mapOpenPositionRow(
+  position: Position,
+  market: Market | null,
+): OpenPositionRow {
+  const stake = Number(position.stake);
+  const entryPrice = Number(position.entryPrice);
+  const yesPrice = market?.currentYesPrice ?? null;
+  let mtmValue: number | null = null;
+  let unrealizedPnl: number | null = null;
+  let unrealizedReturnPct: number | null = null;
+  if (yesPrice != null && Number.isFinite(entryPrice) && entryPrice > 0) {
+    const shares = stake / entryPrice;
+    // shares × current_price_of_the_side_we_bought
+    const sidePrice = position.betOutcome === 0 ? yesPrice : 1 - yesPrice;
+    mtmValue = shares * sidePrice;
+    unrealizedPnl = mtmValue - stake;
+    unrealizedReturnPct = unrealizedPnl / stake;
+  }
+  return {
     ...position,
     question: market?.questionText ?? null,
     category: market?.category ?? null,
     resolutionTimestamp: market?.resolutionTimestamp ?? null,
-  }));
+    currentYesPrice: yesPrice,
+    priceUpdatedAt: market?.priceUpdatedAt ?? null,
+    mtmValue,
+    unrealizedPnl,
+    unrealizedReturnPct,
+  };
 }
 
-export type ClosedPositionRow = OpenPositionRow & { realizedReturnPct: number | null };
+export type ClosedPositionRow = PositionWithMarket & { realizedReturnPct: number | null };
 
 export async function getClosedPositions(
   strategyId: string,
@@ -288,12 +403,7 @@ export async function getMarketDetail(
 
   return {
     market: m[0],
-    positions: posRows.map(({ position, market }) => ({
-      ...position,
-      question: market?.questionText ?? null,
-      category: market?.category ?? null,
-      resolutionTimestamp: market?.resolutionTimestamp ?? null,
-    })),
+    positions: posRows.map(({ position, market }) => mapOpenPositionRow(position, market)),
     signals: sigRows.map(({ signal, market }) => ({
       ...signal,
       question: market?.questionText ?? null,

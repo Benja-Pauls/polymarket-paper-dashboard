@@ -95,14 +95,24 @@ export default async function StrategyDetailPage({
           label="Cumulative P&L"
           value={fmtUsdSigned(summary.cumulativePnl)}
           tone={summary.cumulativePnl > 0 ? "pos" : summary.cumulativePnl < 0 ? "neg" : "neutral"}
+          subtitle={`real ${fmtUsdSigned(summary.realizedPnl)} · unreal ${fmtUsdSigned(summary.unrealizedPnl)}`}
         />
-        <KPI label="Realized P&L" value={fmtUsdSigned(summary.realizedPnl)} />
+        <KPI
+          label="Unrealized P&L"
+          value={fmtUsdSigned(summary.unrealizedPnl)}
+          tone={summary.unrealizedPnl > 0 ? "pos" : summary.unrealizedPnl < 0 ? "neg" : "neutral"}
+          subtitle={
+            summary.nOpen === 0
+              ? "no open positions"
+              : `${fmtUsd(summary.totalOpenMtm)} MTM · ${summary.nOpenWithPrice}/${summary.nOpen} priced`
+          }
+        />
         <KPI
           label="Cash"
           value={fmtUsd(summary.cashCurrent)}
           subtitle={
             summary.totalOpenStake > 0
-              ? `${fmtUsd(summary.totalOpenStake)} in ${summary.nOpen} open · bankroll ${fmtUsd(Number(strategy.startingBankroll))}`
+              ? `${fmtUsd(summary.totalOpenStake)} cost in ${summary.nOpen} open · bankroll ${fmtUsd(Number(strategy.startingBankroll))}`
               : `/ ${fmtUsd(Number(strategy.startingBankroll))} bankroll`
           }
         />
@@ -147,40 +157,79 @@ export default async function StrategyDetailPage({
                   <TableHeader>
                     <TableRow>
                       <TableHead>Market</TableHead>
-                      <TableHead>Side / outcome</TableHead>
-                      <TableHead className="text-right">Entry price</TableHead>
+                      <TableHead>Side</TableHead>
+                      <TableHead className="text-right">Entry → Now</TableHead>
                       <TableHead className="text-right">Stake</TableHead>
+                      <TableHead className="text-right">Unrealized</TableHead>
                       <TableHead>Entry</TableHead>
                       <TableHead>Resolution</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {openPos.map((p) => (
-                      <TableRow key={p.id}>
-                        <TableCell className="max-w-[26ch]">
-                          <Link
-                            href={`/models/${strategy.id}/markets/${p.marketCid}`}
-                            className="line-clamp-1 hover:underline"
-                          >
-                            {p.question ?? shortCid(p.marketCid)}
-                          </Link>
-                          <span className="text-[10px] font-mono text-muted-foreground">
-                            {p.category ?? "?"} · {shortCid(p.marketCid, 4)}
-                          </span>
-                        </TableCell>
-                        <TableCell className="font-mono text-xs">
-                          BUY · outcome {p.betOutcome}
-                        </TableCell>
-                        <TableCell className="text-right font-mono">{fmtPrice(p.entryPrice)}</TableCell>
-                        <TableCell className="text-right font-mono">{fmtUsd(Number(p.stake))}</TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
-                          {fmtTs(Number(p.entryTs))}
-                        </TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
-                          {fmtDate(p.plannedResolutionTs ?? p.resolutionTimestamp ?? null)}
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                    {openPos.map((p) => {
+                      // For NO bets the "side price" we care about is (1 - YES);
+                      // for YES bets it's just YES. Show the price OF THE SIDE
+                      // we bought so entry → now is apples-to-apples.
+                      const sideNow =
+                        p.currentYesPrice == null
+                          ? null
+                          : p.betOutcome === 0
+                            ? p.currentYesPrice
+                            : 1 - p.currentYesPrice;
+                      const upRet = p.unrealizedReturnPct;
+                      const upTone =
+                        upRet == null
+                          ? "text-muted-foreground"
+                          : upRet > 0.02
+                            ? "text-emerald-400"
+                            : upRet < -0.02
+                              ? "text-red-400"
+                              : "text-muted-foreground";
+                      return (
+                        <TableRow key={p.id}>
+                          <TableCell className="max-w-[26ch]">
+                            <Link
+                              href={`/models/${strategy.id}/markets/${p.marketCid}`}
+                              className="line-clamp-1 hover:underline"
+                            >
+                              {p.question ?? shortCid(p.marketCid)}
+                            </Link>
+                            <span className="text-[10px] font-mono text-muted-foreground">
+                              {p.category ?? "?"} · {shortCid(p.marketCid, 4)}
+                            </span>
+                          </TableCell>
+                          <TableCell className="font-mono text-xs">
+                            {p.betOutcome === 0 ? "YES" : "NO"}
+                          </TableCell>
+                          <TableCell className="text-right font-mono text-xs">
+                            <span>{fmtPrice(p.entryPrice)}</span>
+                            <span className="mx-1 text-muted-foreground">→</span>
+                            <span className={upTone}>
+                              {sideNow == null ? "—" : fmtPrice(sideNow)}
+                            </span>
+                          </TableCell>
+                          <TableCell className="text-right font-mono">{fmtUsd(Number(p.stake))}</TableCell>
+                          <TableCell className={`text-right font-mono ${upTone}`}>
+                            {p.unrealizedPnl == null ? (
+                              "—"
+                            ) : (
+                              <>
+                                {fmtUsdSigned(p.unrealizedPnl)}
+                                <span className="block text-[10px] opacity-70">
+                                  {upRet == null ? "" : `${(upRet * 100).toFixed(1)}%`}
+                                </span>
+                              </>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground">
+                            {fmtTs(Number(p.entryTs))}
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground">
+                            {fmtDate(p.plannedResolutionTs ?? p.resolutionTimestamp ?? null)}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
                   </TableBody>
                 </Table>
               )}

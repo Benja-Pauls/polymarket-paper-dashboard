@@ -22,6 +22,14 @@ export type GammaMarket = {
   archived?: boolean;
   liquidity?: string;
   volume?: string;
+  /**
+   * Latest YES-side price in [0, 1]. Polymarket's Gamma returns
+   * `outcomePrices` as a JSON-stringified array `["0.54", "0.46"]`
+   * with index 0 = YES, index 1 = NO. We parse and expose just the
+   * YES side; NO is implicitly `1 - currentYesPrice`. Null when the
+   * field is missing or unparseable (rare on active markets).
+   */
+  currentYesPrice: number | null;
 };
 
 export type GammaError = { error: string; status?: number };
@@ -187,7 +195,27 @@ function normalize(r: unknown): GammaMarket | null {
     archived: o.archived === true,
     liquidity: typeof o.liquidity === "string" ? o.liquidity : undefined,
     volume: typeof o.volume === "string" ? o.volume : undefined,
+    currentYesPrice: parseYesPrice(o.outcomePrices),
   };
+}
+
+/**
+ * Gamma returns `outcomePrices` as a JSON-stringified array — e.g. the literal
+ * string `"[\"0.545\", \"0.455\"]"` rather than a real JS array. Parse it,
+ * take index 0 (YES), and return as a number in [0, 1]. Returns null on any
+ * shape mismatch so callers can render "—" rather than NaN.
+ */
+function parseYesPrice(raw: unknown): number | null {
+  if (typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    const yes = Number(parsed[0]);
+    if (!Number.isFinite(yes) || yes < 0 || yes > 1) return null;
+    return yes;
+  } catch {
+    return null;
+  }
 }
 
 /** Parse an ISO timestamp ("2026-07-31T12:00:00Z") to unix seconds. */

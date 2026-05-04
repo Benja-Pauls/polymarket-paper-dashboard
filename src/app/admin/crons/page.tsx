@@ -47,6 +47,14 @@ const CRONS: CronDef[] = [
       "Refreshes the OPEN-markets universe from Polymarket Gamma. For each open market: looks up its category in the static label index (free), falls back to Claude Haiku 4.5 (~$0.0001/market). Upserts (condition_id, question_text, category, resolution_timestamp) so strategies have endDate to filter on. Bumped 6h→1h on 2026-04-29 after the resolution-ts gap fix; 1500 LLM calls/run, hourly cadence drains the LLM-needed backlog faster.",
   },
   {
+    name: "refresh-position-prices",
+    path: "/api/cron/refresh-position-prices",
+    schedule: "*/5 * * * *",
+    schedule_human: "every 5 minutes",
+    description:
+      "Fetches current YES price from Polymarket Gamma for every market where some strategy has an open position (typically <300 cids). Powers the dashboard's mark-to-market unrealized P&L view — without this the dashboard would be stuck at cost-basis (entry-price) values until each position resolves, which can take 30+ days. Cheap: one Gamma round-trip per ~25 cids, no LLM calls. Independent of sync-open-markets (which scans all 25K open markets hourly and has its own price-capture pass).",
+  },
+  {
     name: "prune-signals",
     path: "/api/cron/prune-signals",
     schedule: "0 */4 * * *",
@@ -312,6 +320,10 @@ function summariseResult(r: Record<string, unknown> | null): string {
     "matched_static_labels",
     "classified_via_llm",
     "upserted",
+    "prices_updated",
+    "open_position_cids",
+    "clob_returned",
+    "prices_missing",
   ];
   const parts: string[] = [];
   for (const k of interesting) {

@@ -38,12 +38,23 @@ export const config: VercelConfig = {
       // 96 polls/day ≈ 1.4M rows/day) and hit the Neon Hobby 512MB cap on
       // 2026-04-30. Retention: 24h. Bet signals (FK-referenced by positions)
       // are never deleted.
+      //
+      // 2026-05-03 update: the poll cron no longer writes skip signals to
+      // DB by default (LOG_SKIP_SIGNALS_TO_DB=false; they go to Vercel
+      // logs). This cron stays scheduled as defense-in-depth — drains any
+      // remaining historical skip rows + handles the case where someone
+      // flips the env flag back on for forensics.
       path: "/api/cron/prune-signals",
-      // Every 4 hours — daily wasn't enough; signals grow ~1.5M rows/day at
-      // the current poll rate (10 strategies × 1500 trades × 96 polls) and
-      // we hit the Neon 512MB cap on 2026-04-30 AND 2026-05-01. 4-hourly
-      // keeps the table under ~250K rows.
       schedule: "0 */4 * * *",
+    },
+    {
+      // Refresh current_yes_price on markets where any strategy has an
+      // open position. Runs every 5 minutes (much more frequent than the
+      // hourly sync-open-markets) so the dashboard's MTM unrealized P&L
+      // view stays close to real-time. Cheap: one Gamma round-trip per
+      // ~25 cids, no LLM calls. See route file for the why.
+      path: "/api/cron/refresh-position-prices",
+      schedule: "*/5 * * * *",
     },
   ],
 };
