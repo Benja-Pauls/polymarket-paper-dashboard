@@ -23,6 +23,27 @@ export type ClobMarket = {
   noPrice: number | null;
   active: boolean;
   closed: boolean;
+  /**
+   * Winner outcome index, derived from `tokens[i].winner === true`.
+   * 0 = YES won (resolved YES), 1 = NO won (resolved NO), null = unresolved.
+   *
+   * Only meaningful when `closed === true`. CLOB sets `tokens[i].winner` to
+   * a boolean for every token on a resolved market; exactly one is true.
+   * For open markets, the field is absent / always false → null returned.
+   *
+   * This is the AUTHORITATIVE resolution source. The settlement cron uses
+   * it to decide payouts (which then become real-money credits when this
+   * project is taken off paper). MUST stay accurate — see
+   * src/app/api/cron/refresh-position-prices/route.ts for usage.
+   */
+  winnerOutcomeIdx: number | null;
+  /**
+   * Resolution timestamp from `accepting_order_timestamp` on closed markets,
+   * or null. Best-effort — CLOB doesn't expose a clean "resolved at" field;
+   * `accepting_orders=false` typically coincides with resolution and the
+   * timestamp is a close proxy. Used only for display.
+   */
+  resolutionTimestamp: number | null;
 };
 
 /**
@@ -55,13 +76,38 @@ export async function fetchClobMarket(
   const tokens = Array.isArray(data.tokens) ? (data.tokens as Array<Record<string, unknown>>) : [];
   let yesPrice: number | null = null;
   let noPrice: number | null = null;
+  // Track winner across both tokens. Exactly one should be true on a closed
+  // market; if we somehow see two true (shouldn't happen) we treat as unresolved
+  // to fail safe (better to wait for next cycle than settle wrong).
+  let yesIsWinner = false;
+  let noIsWinner = false;
   for (const t of tokens) {
     const outcome = String(t.outcome ?? "").toLowerCase();
     const p = Number(t.price);
-    if (!Number.isFinite(p) || p < 0 || p > 1) continue;
-    if (outcome === "yes") yesPrice = p;
-    else if (outcome === "no") noPrice = p;
+    const isWinner = t.winner === true;
+    if (Number.isFinite(p) && p >= 0 && p <= 1) {
+      if (outcome === "yes") yesPrice = p;
+      else if (outcome === "no") noPrice = p;
+    }
+    if (outcome === "yes" && isWinner) yesIsWinner = true;
+    else if (outcome === "no" && isWinner) noIsWinner = true;
   }
+
+  // Derive winner index. ONLY assign a winner if exactly one token is marked
+  // (defensive against malformed responses or markets in a transitional state).
+  let winnerOutcomeIdx: number | null = null;
+  if (yesIsWinner && !noIsWinner) winnerOutcomeIdx = 0;
+  else if (noIsWinner && !yesIsWinner) winnerOutcomeIdx = 1;
+
+  // CLOB doesn't have an explicit "resolved_at" field. accepting_order_timestamp
+  // is the closest proxy on closed markets — when the orderbook stops accepting
+  // new orders, that's effectively the resolution moment. Best-effort.
+  let resolutionTimestamp: number | null = null;
+  if (data.closed === true && typeof data.accepting_order_timestamp === "string") {
+    const ts = Date.parse(data.accepting_order_timestamp);
+    if (Number.isFinite(ts)) resolutionTimestamp = Math.floor(ts / 1000);
+  }
+
   return {
     conditionId: String(data.condition_id ?? conditionId).toLowerCase(),
     question: typeof data.question === "string" ? data.question : null,
@@ -69,6 +115,8 @@ export async function fetchClobMarket(
     noPrice,
     active: data.active === true,
     closed: data.closed === true,
+    winnerOutcomeIdx,
+    resolutionTimestamp,
   };
 }
 

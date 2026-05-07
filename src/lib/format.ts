@@ -196,6 +196,27 @@ export function nextCronFire(
     return next;
   }
 
+  // Fixed-minute every hour: "M * * * *" (e.g. "0 * * * *" for hourly at :00).
+  // Was missing before — sync-open-markets uses this and the home-page widget
+  // showed "next: —" because the function returned null. Fixed 2026-05-07.
+  if (fixedMin != null && hour === "*") {
+    if (now.getUTCMinutes() < fixedMin) {
+      // Still upcoming this hour
+      next.setUTCMinutes(fixedMin);
+    } else {
+      // Already past this hour's fixedMin, roll to next hour
+      const nextHr = now.getUTCHours() + 1;
+      if (nextHr >= 24) {
+        next.setUTCDate(now.getUTCDate() + 1);
+        next.setUTCHours(0);
+      } else {
+        next.setUTCHours(nextHr);
+      }
+      next.setUTCMinutes(fixedMin);
+    }
+    return next;
+  }
+
   return null;
 }
 

@@ -1,30 +1,32 @@
 // Vercel Cron handler — refresh current_yes_price on markets where any
-// strategy has an open position. Runs every 5 minutes on top of the hourly
-// sync-open-markets, so the dashboard's MTM unrealized P&L stays close to
-// real-time without hammering the API for all 25K open markets.
+// strategy has an open position, AND settle any positions whose markets
+// have resolved on Polymarket.
 //
-// Why a separate cron instead of just bumping sync-open-markets to 5 min:
-//   - sync-open-markets pages 25K+ markets and runs the LLM classifier on
-//     newly-seen ones. That's ~30-60s of API + classifier work per run.
-//     12× more frequent would push our Anthropic spend from ~$6 to ~$72/mo.
-//   - This cron only fetches the small set of markets where we have open
-//     positions (typically <300 cids). Sub-second runtime, $0 LLM spend.
+// Two responsibilities (since both use the same CLOB fetch):
 //
-// Why CLOB and not Gamma: Gamma's `?conditionIds=` filter is broken (returns
-// the default page rather than filtering — verified 2026-05-04). CLOB's
-// `/markets/<condition_id>` endpoint does exact-match lookups by cid and
-// includes live token prices. See src/lib/clob/index.ts for the wire.
+//   1. PRICE REFRESH: keep markets.current_yes_price up-to-date so the
+//      dashboard's MTM unrealized P&L stays accurate (every 5 min).
 //
-// Idempotent: only updates the price columns; no state machine, no
-// ordering requirement. Safe to fire any number of times.
+//   2. SETTLEMENT: when CLOB shows a market is closed (resolved) with a
+//      winner, mark markets.resolved + winner_outcome_idx, then settle every
+//      open position on that market. Cash is credited atomically. This is
+//      MONEY-CORRECTNESS code — see src/lib/settlement/index.ts for the
+//      shared core that does the math, and the bug history that led to the
+//      2026-05-07 fix (settlements weren't firing in production at all).
+//
+// Why both in one cron: refresh-position-prices already calls CLOB for every
+// open-position market every 5 minutes. The CLOB response includes resolution
+// data for free (winner field on closed markets). Doing settlement here means
+// at most 5-minute settlement latency from the moment Polymarket marks a
+// market closed.
+//
+// Idempotency: every UPDATE filters on `settled_ts IS NULL`. Concurrent
+// runs (or the poll cron's own settlement path) cannot double-credit.
 
 import { NextResponse } from "next/server";
-import { isNull, sql } from "drizzle-orm";
 
-import { db } from "@/lib/db";
-import { markets, positions as positionsTable } from "@/lib/db/schema";
-import { fetchClobMarketsBatch } from "@/lib/clob";
 import { recordCronRun } from "@/lib/cron-tracker";
+import { refreshAndSettle } from "@/lib/settlement";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -41,75 +43,12 @@ function isAuthorized(req: Request): boolean {
   return process.env.VERCEL_ENV !== "production";
 }
 
-type RefreshResult = {
-  ok: boolean;
-  open_position_cids: number;
-  clob_returned: number;
-  prices_updated: number;
-  prices_missing: number;
-};
-
-async function runOnce(): Promise<RefreshResult> {
-  const result: RefreshResult = {
-    ok: true,
-    open_position_cids: 0,
-    clob_returned: 0,
-    prices_updated: 0,
-    prices_missing: 0,
-  };
-
-  // 1. Find every distinct condition_id that has an unsettled position.
-  //    We don't filter by strategy.status — even retired strategies' open
-  //    positions need accurate MTM until they settle (the historical P&L
-  //    chart on a retired strategy still uses MTM).
-  const rows = await db
-    .selectDistinct({ cid: positionsTable.marketCid })
-    .from(positionsTable)
-    .where(isNull(positionsTable.settledTs));
-  const openCids = rows.map((r) => r.cid);
-  result.open_position_cids = openCids.length;
-  if (openCids.length === 0) {
-    console.log(`[refresh-position-prices] no open positions, nothing to do`);
-    return result;
-  }
+async function runOnce() {
+  const summary = await refreshAndSettle();
   console.log(
-    `[refresh-position-prices] fetching CLOB prices for ${openCids.length} markets with open positions`,
+    `[refresh-position-prices] prices: ${summary.prices_updated} updated, ${summary.prices_missing} missing | resolutions: ${summary.markets_newly_resolved} markets, ${summary.positions_settled} positions, $${summary.cash_credited_total_usd.toFixed(2)} credited`,
   );
-
-  // 2. Batch-fetch from CLOB at concurrency 8.
-  //    ~100 markets × ~50ms each / 8 concurrency ≈ <1s wall-time.
-  const byCid = await fetchClobMarketsBatch({
-    conditionIds: openCids,
-    concurrency: 8,
-  });
-  result.clob_returned = byCid.size;
-
-  // 3. For each cid we got back, write the new price to markets table.
-  //    Single-row UPDATEs (not bulk upsert) because there's only ~hundreds
-  //    of these and we don't want to risk SQLSTATE 21000 from a duplicate
-  //    cid in the batch (paranoid after 2026-05-02 dedupe fix).
-  const now = new Date();
-  for (const cid of openCids) {
-    const m = byCid.get(cid.toLowerCase());
-    if (!m) continue;
-    if (m.yesPrice == null) {
-      result.prices_missing += 1;
-      continue;
-    }
-    await db
-      .update(markets)
-      .set({
-        currentYesPrice: m.yesPrice,
-        priceUpdatedAt: now,
-        updatedAt: now,
-      })
-      .where(sql`${markets.conditionId} = ${cid}`);
-    result.prices_updated += 1;
-  }
-  console.log(
-    `[refresh-position-prices] updated ${result.prices_updated} prices, ${result.prices_missing} missing-price, ${openCids.length - result.clob_returned} not-found-on-clob`,
-  );
-  return result;
+  return { ok: true, ...summary };
 }
 
 export async function GET(req: Request) {
@@ -118,7 +57,9 @@ export async function GET(req: Request) {
   }
   const t0 = Date.now();
   try {
-    const result = await recordCronRun("refresh-position-prices", () => runOnce());
+    const result = await recordCronRun("refresh-position-prices", () =>
+      runOnce(),
+    );
     const elapsedMs = Date.now() - t0;
     console.log(`[cron] refresh-position-prices done in ${elapsedMs}ms`, result);
     return NextResponse.json({ ...result, elapsed_ms: elapsedMs });

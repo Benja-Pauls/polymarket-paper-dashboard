@@ -38,6 +38,7 @@ import {
   fetchMarketMetadataBatch,
   type DecodedTrade,
 } from "@/lib/goldsky";
+import { fetchClobMarket } from "@/lib/clob";
 import { fetchTradesSinceFromDataApi } from "@/lib/trades";
 import {
   evaluateTrade,
@@ -157,14 +158,22 @@ async function settleResolvedOpenPositions(args: {
   for (const { pos, mkt } of open) {
     if (!mkt) continue;
     if (!mkt.resolved || mkt.winnerOutcomeIdx == null) {
+      // Fallback: try to fetch resolution from CLOB. The
+      // refresh-position-prices cron already does this proactively every 5
+      // min, but this path catches anything it missed (e.g. a market that
+      // resolved between two refresh cycles AND poll catches it first).
+      // PRIOR BUG (2026-05-07): this used fetchMarketMetadata from Goldsky,
+      // which doesn't index post-Jan-5-2026 markets — so resolution was
+      // never detected and "real $0" persisted forever. Switched to CLOB.
       try {
-        const live = await fetchMarketMetadata({ conditionId: mkt.conditionId });
-        if (live && live.winnerOutcomeIdx != null) {
+        const live = await fetchClobMarket(mkt.conditionId);
+        if (live && live.closed && live.winnerOutcomeIdx != null) {
           await db
             .update(markets)
             .set({
-              resolutionTimestamp: live.resolutionTimestamp,
-              payoutsJson: live.payouts,
+              resolutionTimestamp:
+                live.resolutionTimestamp ?? mkt.resolutionTimestamp,
+              payoutsJson: live.winnerOutcomeIdx === 0 ? ["1", "0"] : ["0", "1"],
               resolved: 1,
               winnerOutcomeIdx: live.winnerOutcomeIdx,
               updatedAt: new Date(),
@@ -187,7 +196,10 @@ async function settleResolvedOpenPositions(args: {
       winner: outcome,
       slippage: args.slippage,
     });
-    await db
+    // Race-safe UPDATE: `WHERE settled_ts IS NULL` so a concurrent
+    // refresh-position-prices settlement can't double-credit. If the row
+    // was already settled by the other path, rowCount=0 and we skip.
+    const upd = await db
       .update(positionsTable)
       .set({
         won: settle.won,
@@ -195,7 +207,16 @@ async function settleResolvedOpenPositions(args: {
         realizedReturn: settle.realizedReturn,
         settledTs: NOW_S(),
       })
-      .where(eq(positionsTable.id, pos.id));
+      .where(
+        and(
+          eq(positionsTable.id, pos.id),
+          isNull(positionsTable.settledTs),
+        ),
+      );
+    if (!upd.rowCount || upd.rowCount === 0) {
+      // Another path settled this; don't credit cash.
+      continue;
+    }
     cashDelta += settle.payout;
     settled += 1;
   }
